@@ -324,6 +324,7 @@ DEF_SETTINGS = {
     "game_mode": True,
     "notify": True,
     "lite": False,
+    "auto_update": True,
     "sound": True,
     "volume": 50,
     "quiet_fullscreen": False,
@@ -1221,6 +1222,138 @@ def start_hook():
 HK.update(load_settings())
 
 
+# --- updater ---------------------------------------------------------------
+APP_VERSION = "1.0.1"          # bump this before every release build, and tag the release the same (v1.0.1)
+UPDATE_REPO = "ahhmilo/Helpy"
+FORCE_UPDATE = True           # True: the prompt only offers "Update now" or "Exit Helpy" (no "Later")
+UPD = {"info": None, "busy": False}
+
+
+def _ver(t):
+    import re
+    n = [int(x) for x in re.findall(r"\d+", str(t))[:4]]
+    return tuple(n + [0] * (4 - len(n)))
+
+
+def fetch_update_info():
+    """Asks GitHub for the latest release. Returns a dict for the UI."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+            headers={"User-Agent": f"Helpy/{APP_VERSION}", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            j = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return {"ok": False, "msg": "Couldn't check for updates. Check your connection and try again."}
+    tag = str(j.get("tag_name", ""))
+    asset = None
+    for a in j.get("assets") or []:
+        n = str(a.get("name", "")).lower()
+        if n.endswith(".exe") and (asset is None or n == "helpy.exe"):
+            asset = a
+    dg = str((asset or {}).get("digest") or "")
+    info = {
+        "version": tag.lstrip("vV"),
+        "notes": str(j.get("body") or "").strip()[:1500],
+        "page": str(j.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases/latest"),
+        "url": (asset or {}).get("browser_download_url", ""),
+        "size": int((asset or {}).get("size") or 0),
+        "sha256": dg.split(":", 1)[1] if dg.lower().startswith("sha256:") else "",
+    }
+    UPD["info"] = info
+    return {"ok": True, "available": bool(asset and _ver(tag) > _ver(APP_VERSION)), "current": APP_VERSION,
+            "version": info["version"], "notes": info["notes"], "force": FORCE_UPDATE, "can_install": IS_EXE}
+
+
+def _download_file(url, dest, want_size=0, want_sha="", on_progress=None):
+    """Streams url to dest and checks it. Raises RuntimeError if anything looks wrong."""
+    import hashlib, urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": f"Helpy/{APP_VERSION}"})
+    h, got, last = hashlib.sha256(), 0, -1
+    with urllib.request.urlopen(req, timeout=30) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or want_size or 0)
+        while True:
+            b = r.read(65536)
+            if not b:
+                break
+            f.write(b)
+            h.update(b)
+            got += len(b)
+            if total and on_progress:
+                p = min(100, got * 100 // total)
+                if p != last:
+                    last = p
+                    on_progress(p)
+    if (total and got != total) or (want_size and got != want_size):
+        raise RuntimeError("The download was cut short. Please try again.")
+    with open(dest, "rb") as f:
+        if f.read(2) != b"MZ":
+            raise RuntimeError("The downloaded file isn't a Windows program.")
+    if want_sha and h.hexdigest().lower() != want_sha.lower():
+        raise RuntimeError("The download didn't match GitHub's checksum, so it was thrown away.")
+
+
+def _updater_script(old, new):
+    """Batch file: waits for Helpy to exit, swaps in the new exe, starts it again, deletes itself."""
+    old, new = old.replace("%", "%%"), new.replace("%", "%%")
+    return ("@echo off\r\nchcp 65001 >nul\r\nset /a n=0\r\n:retry\r\n"
+            f'move /y "{new}" "{old}" >nul 2>&1\r\n'
+            "if not errorlevel 1 goto done\r\n"
+            "set /a n+=1\r\nif %n% GEQ 120 goto fail\r\n"
+            "ping -n 2 127.0.0.1 >nul\r\ngoto retry\r\n:done\r\n"
+            "set PYINSTALLER_RESET_ENVIRONMENT=1\r\n"
+            f'start "" "{old}"\r\n:fail\r\n'
+            '(goto) 2>nul & del "%~f0"\r\n')
+
+
+def _upd_js(code):
+    try:
+        WINDOW.evaluate_js(code)
+    except Exception:
+        pass
+
+
+def _do_update():
+    info, dest = UPD["info"] or {}, None
+    try:
+        exe = os.path.abspath(sys.executable)
+        folder = os.path.dirname(exe)
+        if not os.access(folder, os.W_OK):
+            raise RuntimeError("Helpy's folder isn't writable. Move Helpy.exe somewhere you own, or download the update from the Releases page.")
+        if not str(info.get("url", "")).startswith("https://github.com/"):
+            raise RuntimeError("Unexpected download address.")
+        dest = os.path.join(folder, "Helpy.update.exe")
+        _download_file(info["url"], dest, info.get("size", 0), info.get("sha256", ""), lambda p: _upd_js(f"updProg({p})"))
+        bat = os.path.join(tempfile.gettempdir(), "helpy_update.bat")
+        with open(bat, "w", encoding="utf-8", newline="") as f:
+            f.write(_updater_script(exe, dest))
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+        subprocess.Popen(["cmd", "/c", bat], env=env, creationflags=0x08000000 | 0x00000200, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _upd_js("updDone()")
+        time.sleep(0.8)
+        quit_app()
+    except Exception as e:
+        try:
+            if dest and os.path.exists(dest):
+                os.remove(dest)
+        except OSError:
+            pass
+        UPD["busy"] = False
+        msg = str(e) if isinstance(e, RuntimeError) and str(e) else "The download failed. Check your connection and try again."
+        _upd_js("updFail(%s)" % json.dumps(msg))
+
+
+def clean_old_update():
+    if IS_EXE:
+        try:
+            os.remove(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "Helpy.update.exe"))
+        except OSError:
+            pass
+# --- end updater -----------------------------------------------------------
+
+
 class Api:
     def get_settings(self):
         return {**load_settings(), **_startup_info()}
@@ -1239,6 +1372,7 @@ class Api:
         cur["game_mode"] = bool(s.get("game_mode", True))
         cur["notify"] = bool(s.get("notify", True))
         cur["lite"] = bool(s.get("lite", False))
+        cur["auto_update"] = bool(s.get("auto_update", True))
         cur["sound"] = bool(s.get("sound", True))
         cur["volume"] = max(0, min(100, int(s.get("volume", 50))))
         cur["quiet_fullscreen"] = bool(s.get("quiet_fullscreen", False))
@@ -1424,6 +1558,27 @@ class Api:
     def close(self):
         quit_app()
 
+    def app_info(self):
+        return {"version": APP_VERSION, "exe": IS_EXE}
+
+    def check_update(self):
+        return fetch_update_info()
+
+    def start_update(self):
+        info = UPD["info"]
+        if not IS_EXE:
+            return {"ok": False, "msg": "Auto-update only works in the built Helpy.exe."}
+        if not info or not info.get("url"):
+            return {"ok": False, "msg": "There's nothing to download."}
+        if not UPD["busy"]:
+            UPD["busy"] = True
+            threading.Thread(target=_do_update, daemon=True).start()
+        return {"ok": True}
+
+    def open_release(self):
+        import webbrowser
+        webbrowser.open((UPD["info"] or {}).get("page") or f"https://github.com/{UPDATE_REPO}/releases/latest")
+
     def state(self, raw=False):
         devs = list_devices()
         for d in devs:
@@ -1569,7 +1724,6 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.15)}
 #lb.full.ui .lbbar{opacity:1;pointer-events:auto}#lb.full .nv{opacity:0}#lb.full.ui .nv{opacity:1}#lb.full:not(.ui){cursor:none}
 .badge{display:none;margin-left:7px;min-width:18px;height:18px;padding:0 5px;border-radius:99px;background:var(--bad);color:#fff;font-size:11px;font-weight:700;line-height:18px;text-align:center;vertical-align:1px}.badge.on{display:inline-block;animation:pop .45s var(--spring)}
 .tile.new:after{content:"";position:absolute;top:10px;right:10px;width:12px;height:12px;border-radius:50%;background:var(--ac);box-shadow:0 0 0 3px rgba(0,0,0,.45)}
-@media(prefers-reduced-motion:reduce){*{transition-duration:.01s!important;animation:none!important}}
 
 .wb svg{pointer-events:none}
 #ed{position:fixed;top:48px;left:0;right:0;bottom:0;z-index:70;display:none;flex-direction:column;background:#0b0b0d;color:#fff}
@@ -1625,6 +1779,20 @@ body.lite *,body.lite *:before,body.lite *:after{animation:none!important;transi
 body.lite #lb,body.lite #ov,body.lite #toast{-webkit-backdrop-filter:none!important;backdrop-filter:none!important}
 body.lite #lb:not(.full){background:rgba(0,0,0,.93)}
 body.lite #lbi,body.lite #toast,body.lite .nv,body.lite #top,body.lite #edbox,body.lite .sw i:after,body.lite input[type=range]::-webkit-slider-thumb{box-shadow:none!important}
+
+/* page / tab swap: old one slides out, new one slides in */
+.page.on.out,.pane.on.out{animation:slideout .14s ease-in forwards}
+@keyframes slideout{to{opacity:0;transform:translateX(var(--dxo,0px)) scale(.985)}}
+/* update prompt */
+#upd{position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.55);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px)}
+#upd.show{display:flex;animation:fade .3s var(--ease)}
+.ubox{width:420px;max-width:calc(100vw - 40px);background:var(--card);border-radius:22px;padding:26px;box-shadow:0 30px 80px #0008;animation:pop .45s var(--spring)}
+.ut{font-size:22px;font-weight:600;letter-spacing:-.02em}.uv{color:var(--ac);font-weight:600;margin:4px 0 12px;font-variant-numeric:tabular-nums}
+.un{max-height:150px;overflow:auto;white-space:pre-wrap;font-family:inherit;font-size:13px;line-height:1.5;color:var(--mu);background:var(--card2);border-radius:12px;padding:12px 14px;margin:0 0 14px}
+.ubar{display:none;height:6px;border-radius:99px;background:var(--card2);overflow:hidden;margin:4px 0 8px}.ubar i{display:block;height:100%;width:0;background:var(--ac);border-radius:99px;transition:width .2s}
+.us{min-height:18px;font-size:13px;color:var(--mu);margin-bottom:12px}.us.bad{color:var(--bad)}
+.ubtns{display:flex;gap:10px}.ubtns .btn{flex:1}.ubtns .btn[disabled]{opacity:.5;pointer-events:none}
+body.lite #upd{-webkit-backdrop-filter:none;backdrop-filter:none}
 </style></head><body>
 <div id="app">
  <header>
@@ -1701,10 +1869,21 @@ body.lite #lbi,body.lite #toast,body.lite .nv,body.lite #top,body.lite #edbox,bo
    <div class="grp" style="max-width:640px">
     <div class="sl"><div><span>Low-end mode</span><label class="sw"><input type="checkbox" id="s_lite" onchange="saveSet()"><i></i></label></div><p class="note" style="margin:8px 0 0">Turns off animations, transitions, smooth scrolling and blur effects. Helps on older or slower PCs.</p></div>
    </div>
+   <h3 style="margin-top:22px">Updates</h3>
+   <div class="grp" style="max-width:640px">
+    <div class="sl"><div><span>Helpy <b id="s_ver"></b></span><button class="mod" id="s_updbtn" onclick="checkUpd(true)">Check for updates</button></div><p class="note" id="s_updmsg" style="margin:8px 0 0"></p></div>
+    <div class="sl"><div><span>Check for updates when Helpy starts</span><label class="sw"><input type="checkbox" id="s_auto" onchange="saveSet()"><i></i></label></div></div>
+   </div>
   </main>
  </div>
 </div>
 <div id="toast"></div>
+<div id="upd"><div class="ubox">
+ <div class="ut">Update available</div><div class="uv" id="uv"></div>
+ <pre class="un" id="un"></pre>
+ <div class="ubar" id="ubar"><i id="ubi"></i></div><div class="us" id="us"></div>
+ <div class="ubtns" id="ubtns"><button class="btn" id="ub_go" onclick="updGo()">Update now</button><button class="btn sec" id="ub_no" onclick="updLater()">Later</button></div>
+</div></div>
 <div id="lb">
  <div class="lbbar"><span id="lbn"></span><span style="flex:1"></span>
   <button class="btn sec" onclick="lbEdit()">Edit</button><button class="btn sec" onclick="lbFull()">Full view</button><button class="btn sec" onclick="lbCopy()">Copy</button><button class="btn sec" onclick="lbShow()">Show in folder</button><button class="btn sec del" id="lbdel" onclick="lbDel()">Delete</button><button class="btn" onclick="closeLB()">Done</button></div>
@@ -1811,9 +1990,9 @@ const fmt=(k,v)=>k=='gamma'?(+v).toFixed(2):k=='brightness'?(v>0?'+':'')+v:v+(PC
 const frac=(v,a,b)=>(v-a)/(b-a)*100;
 let CT=null;
 function view(i){
- {const el=[$('pModes'),$('pColor')][i];if(i!==VW)el.style.setProperty('--dx',((i>VW?1:-1)*34)+'px');VW=i}
+ const from=VW;VW=i;
  $('view').style.setProperty('--i',i);document.querySelectorAll('#view .sg').forEach((b,j)=>b.classList.toggle('on',j==i));
- $('pModes').classList.toggle('on',i==0);$('pColor').classList.toggle('on',i==1)}
+ swapTo([$('pModes'),$('pColor')],from,i,'v')}
 function renderColor(){
  const d=S.devices[D],c=d.color;
  $('clr').innerHTML=CH.filter(x=>x[0]!='vibrance'||d.vib.ok).map(([k,l,a,b,s,cl])=>`<div class="sl ${cl}"><div><span>${l}</span><output id="o_${k}">${fmt(k,c[k])}</output></div><input type="range" data-k="${k}" min="${a}" max="${b}" step="${s}" value="${c[k]}" style="--p:${frac(c[k],a,b)}%" oninput="slide(this,false)" onchange="slide(this,true)"></div>`).join('');
@@ -1834,12 +2013,21 @@ let ST=null,G={items:[],folder:''},LB=-1,IO=null,CAPK=null,DELT=null;
 function vkName(v){const m={44:'PrtScn',45:'Ins',46:'Del',36:'Home',35:'End',33:'PgUp',34:'PgDn',32:'Space',19:'Pause',145:'ScrLk',192:'`',13:'Enter',9:'Tab'};
  if(m[v])return m[v];if(v>=112&&v<=135)return 'F'+(v-111);if((v>=48&&v<=57)||(v>=65&&v<=90))return String.fromCharCode(v);return 'Key '+v}
 function combo(b){if(!b.vk)return 'a shortcut (set one in Shortcuts)';return [b.win&&'Win',b.ctrl&&'Ctrl',b.alt&&'Alt',b.shift&&'Shift',vkName(b.vk)].filter(Boolean).join('+')}
-let PG=0,VW=0;
+let PG=0,VW=0;var SW={};
+function swapTo(els,from,to,key){
+ if(from===to)return;
+ const old=els[from],nw=els[to],dir=to>from?1:-1;
+ clearTimeout(SW[key]);
+ els.forEach((e,j)=>{if(j!==from&&j!==to)e.classList.remove('on','out')});
+ nw.classList.remove('out');
+ if(LITE){old.classList.remove('on','out');nw.classList.add('on');return}
+ old.style.setProperty('--dxo',(-dir*22)+'px');old.classList.add('out');
+ SW[key]=setTimeout(()=>{old.classList.remove('on','out');nw.style.setProperty('--dx',(dir*34)+'px');nw.classList.add('on')},140)}
 function page(i){
  if(LB>=0||ED)return;
- {const el=[$('body'),$('shots'),$('setp')][i];if(i!==PG)el.style.setProperty('--dx',((i>PG?1:-1)*34)+'px');PG=i}
+ const from=PG;PG=i;
  $('nav').style.setProperty('--i',i);document.querySelectorAll('#nav .sg').forEach((b,j)=>b.classList.toggle('on',j==i));
- $('body').classList.toggle('on',i==0);$('shots').classList.toggle('on',i==1);$('setp').classList.toggle('on',i==2);if(i==1)galleryRefresh()}
+ swapTo([$('body'),$('shots'),$('setp')],from,i,'p');if(i==1)galleryRefresh()}
 function renderKeys(){
  const names={region:'Region screenshot',full:'Full screen screenshot'};
  for(const k of ['region','full']){const b=ST[k];
@@ -1850,9 +2038,9 @@ function renderKeys(){
 async function saveST(){ST.enabled=$('sen').checked;ST=await api().set_settings(ST);renderKeys()}
 function mod(k,m){ST[k][m]=!ST[k][m];saveST()}
 function capKey(k){CAPK=k;const b=document.querySelector(`#krow_${k} .key`);b.textContent='Press a key…';b.classList.add('cap')}
-function renderSet(){renderSnd();$('s_lite').checked=!!ST.lite;applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
+function renderSet(){renderSnd();$('s_lite').checked=!!ST.lite;$('s_auto').checked=ST.auto_update!==false;applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
 async function saveSet(){
- ST.lite=$('s_lite').checked;ST.game_mode=$('s_game').checked;ST.notify=$('s_notify').checked;ST.sound=$('s_snd').checked;ST.volume=+$('s_vol').value;ST.quiet_fullscreen=$('s_quiet').checked;ST.sound_fs_only=$('s_fsonly').checked;
+ ST.lite=$('s_lite').checked;ST.auto_update=$('s_auto').checked;ST.game_mode=$('s_game').checked;ST.notify=$('s_notify').checked;ST.sound=$('s_snd').checked;ST.volume=+$('s_vol').value;ST.quiet_fullscreen=$('s_quiet').checked;ST.sound_fs_only=$('s_fsonly').checked;
  await api().set_startup($('s_start').checked);ST=await api().set_settings(ST);renderKeys()}
 let LBF=false,LBA=false,UIT=null;
 function lbUi(){const l=$('lb');l.classList.add('ui');clearTimeout(UIT);if(LBF)UIT=setTimeout(()=>l.classList.remove('ui'),2500)}
@@ -1915,7 +2103,9 @@ document.addEventListener('keydown',e=>{
  if(LB<0||CAPK||ED)return;if(e.key=='Escape'){if(LBF)lbFull();else closeLB()}if(e.key=='f'||e.key=='F')lbFull();if(e.key=='ArrowLeft')lbGo(-1);if(e.key=='ArrowRight')lbGo(1)});
 document.addEventListener('keydown',e=>{if(!open())return;if(e.key=='Enter')keep();if(e.key=='Escape')undo()});
 $('q').oninput=renderList;
-window.addEventListener('pywebviewready',async()=>{ST=await api().get_settings();applyLite();renderKeys();refresh(true);api().unseen_count().then(setBadge)});
+window.addEventListener('pywebviewready',async()=>{ST=await api().get_settings();applyLite();renderKeys();refresh(true);api().unseen_count().then(setBadge);
+ api().app_info().then(i=>{$('s_ver').textContent='v'+i.version});
+ if(ST.auto_update!==false)setTimeout(()=>checkUpd(false),3000)});
 
 /* ---- maximize ---- */
 async function maxi(){setMax(await api().toggle_maximize())}
@@ -2062,6 +2252,40 @@ let LBD=null;
 const lbBg=t=>t&&(t.id=='lb'||(t.classList&&(t.classList.contains('lbwrap')||t.classList.contains('lbbar')))||(t.tagName=='SPAN'&&t.parentElement&&t.parentElement.classList.contains('lbbar')));
 $('lb').addEventListener('mousedown',e=>{LBD=e.target});
 $('lb').addEventListener('click',e=>{if(ED||LB<0)return;if(lbBg(e.target)&&lbBg(LBD)){if(LBF)lbFull();else closeLB()}});
+
+/* ---- updater ---- */
+var UI_UPD=null;
+function updShow(r){
+ UI_UPD=r;$('uv').textContent=`v${r.current}  →  v${r.version}`;
+ $('un').textContent=r.notes||'';$('un').style.display=r.notes?'':'none';
+ $('us').textContent='';$('us').classList.remove('bad');$('ubar').style.display='none';$('ubi').style.width='0';
+ const go=$('ub_go'),no=$('ub_no');go.disabled=false;go.textContent=r.can_install?'Update now':'Open download page';
+ no.style.display='';no.textContent=r.force?'Exit Helpy':'Later';no.onclick=r.force?()=>quit():updLater;
+ $('upd').classList.add('show')}
+function updLater(){$('upd').classList.remove('show')}
+async function updGo(){
+ if(!UI_UPD)return;
+ if(!UI_UPD.can_install){api().open_release();return}
+ const r=await api().start_update();
+ if(!r.ok){$('us').classList.add('bad');$('us').textContent=r.msg;return}
+ $('ub_go').disabled=true;$('ub_no').style.display='none';
+ $('us').classList.remove('bad');$('us').textContent='Downloading…';$('ubar').style.display='block'}
+function updProg(p){$('ubi').style.width=p+'%';$('us').textContent='Downloading… '+p+'%'}
+function updDone(){$('ubi').style.width='100%';$('us').textContent='Restarting Helpy…'}
+function updFail(m){$('us').classList.add('bad');$('us').textContent=m;$('ubar').style.display='none';
+ const go=$('ub_go');go.disabled=false;go.textContent='Try again';$('ub_no').style.display='';
+ if(UI_UPD&&UI_UPD.can_install){const b=$('ub_no');b.textContent=UI_UPD.force?'Exit Helpy':'Later'}}
+async function checkUpd(manual){
+ const b=$('s_updbtn');
+ if(manual){b.disabled=true;$('s_updmsg').textContent='Checking…'}
+ let r;try{r=await api().check_update()}catch(e){r={ok:false,msg:'Couldn\'t check for updates.'}}
+ if(manual)b.disabled=false;
+ if(!r.ok){if(manual)$('s_updmsg').textContent=r.msg;return}
+ if(r.available){
+  if(manual)$('s_updmsg').textContent=`Version ${r.version} is available.`;
+  if(LB>=0||ED){toast(`Helpy ${r.version} is available. Open Settings to update.`);return}
+  updShow(r)}
+ else if(manual)$('s_updmsg').textContent=`You're on the latest version (v${r.current}).`}
 </script></body></html>
 """
 
@@ -2145,6 +2369,7 @@ def main():
         return
     if IS_EXE and startup_enabled():
         set_startup(True)  # re-point the startup entry if the exe was moved
+    clean_old_update()
     apply_saved_colors()
     import webview
     WINDOW = webview.create_window("Helpy", html=HTML, js_api=Api(), width=1120, height=760,

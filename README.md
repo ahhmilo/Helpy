@@ -89,6 +89,8 @@ Delete that folder to reset Helpy completely. Updating or rebuilding the exe nev
 
 Python · pywebview (WebView2) · ctypes / Win32 display and gamma APIs · NVAPI · Pillow · NumPy · dxcam · pystray · PyInstaller
 
+> Developed with AI assistance from Claude (Anthropic).
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

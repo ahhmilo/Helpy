@@ -79,6 +79,10 @@ Settings live outside the app in `%APPDATA%\Helpy\`:
 
 Delete that folder to reset Helpy completely. Updating or rebuilding the exe never touches it.
 
+## Updates
+Helpy checks GitHub for a newer release when it starts and offers to update itself in one click.
+You can turn this off or check manually in Settings → Updates.
+
 ## Notes
 
 - With the default `Win+Shift+S` binding, Helpy takes the shortcut over while it runs, so the Snipping Tool won't open. Quit Helpy and Windows gets it back, or bind a different key in Settings.
@@ -88,6 +92,8 @@ Delete that folder to reset Helpy completely. Updating or rebuilding the exe nev
 ## Tech
 
 Python · pywebview (WebView2) · ctypes / Win32 display and gamma APIs · NVAPI · Pillow · NumPy · dxcam · pystray · PyInstaller
+
+---
 
 > Developed with AI assistance from Claude (Anthropic).
 

@@ -24,13 +24,12 @@ Built with Python, a native Windows API backend and a custom HTML/CSS/JS interfa
 - **Region screenshot** (default `Win+Shift+S`) and **full-screen screenshot** hotkeys, both rebindable in Settings. They work from the tray and keep working in Full view.
 - **Fullscreen-game friendly.** In a fullscreen app, the region shortcut takes an instant full-screen shot instead of an overlay that would kick the game out of fullscreen.
 - Every shot is saved to your folder and copied to the clipboard.
-- Optional popup notification and camera sound (bring your own sound file, set the volume, or silence it in games).
+- Optional popup notification that fades and slides in and out, plus a camera sound (bring your own sound file, set the volume, or silence it in games).
 - **Gallery** with thumbnails, a "new" badge for shots you haven't opened yet, copy, show in folder and delete.
 
 ### Viewer
-- Full view, previous/next navigation and click-outside-to-close.
+- Full view, previous/next navigation with a slide animation, and click-outside-to-close.
 - **Ctrl + scroll** to zoom toward your cursor, drag to move around, scroll back out to reset.
-- Click for actual-size view.
 
 ### Editor
 - **Brush** with a size slider and any color: color picker, hex or RGB input, quick swatches, or an eyedropper that picks a color straight from the image. Handy for covering things up.
@@ -39,7 +38,7 @@ Built with Python, a native Windows API backend and a custom HTML/CSS/JS interfa
 
 ### App
 - Maximize / restore, minimize to tray, optional launch at Windows startup.
-- Animated tab and page transitions with hover feedback.
+- Animated page and tab transitions, hover feedback and a smooth gliding text caret.
 - **Low-end mode** (Settings → Performance) turns off animations, smooth scrolling and blur effects for older PCs.
 
 ---
@@ -80,8 +79,8 @@ Settings live outside the app in `%APPDATA%\Helpy\`:
 Delete that folder to reset Helpy completely. Updating or rebuilding the exe never touches it.
 
 ## Updates
-Helpy checks GitHub for a newer release when it starts and offers to update itself in one click.
-You can turn this off or check manually in Settings → Updates.
+
+Helpy checks GitHub for a newer release when it starts and again every few hours while it's running. When one is available you're asked to **update now** or exit; Helpy downloads the new `Helpy.exe`, replaces itself and restarts. You can also check by hand in Settings → Updates.
 
 ## Notes
 

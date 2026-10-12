@@ -1048,39 +1048,55 @@ def run_toast(img_path, title, body):
         user32.SetWindowLongPtrW(hw, -20, user32.GetWindowLongPtrW(hw, -20) | 0x08000000 | 0x80)
     except Exception:
         pass
-    clicked, paused = [], [False]
+    clicked, paused, leaving = [], [False], [False]
+
+    def leave():
+        """Fade + drift out, then close."""
+        if leaving[0]:
+            return
+        leaving[0] = True
+        s0 = time.perf_counter()
+
+        def step():
+            t = min((time.perf_counter() - s0) / 0.34, 1.0)
+            e = t * t * (3 - 2 * t)
+            root.attributes("-alpha", 1.0 - e)
+            root.geometry(f"{W}x{H}+{fx + int(e * 44 * sc)}+{fy}")
+            if t < 1.0:
+                root.after(8, step)
+            else:
+                root.destroy()
+        step()
 
     def click(e):
         if e.x > W - int(54 * sc) and e.y < int(52 * sc):  # the little x just dismisses it
-            root.destroy()
+            leave()
             return
-        clicked.append(1)
-        root.destroy()
+        if not leaving[0]:
+            clicked.append(1)
+        leave()
     cv.bind("<Button-1>", click)
     cv.bind("<Enter>", lambda e: paused.__setitem__(0, True))
     cv.bind("<Leave>", lambda e: paused.__setitem__(0, False))
-    t0, left = time.time(), [5.0]
+    t0, left = time.perf_counter(), [5.0]
 
     def slide_in():
-        t = min((time.time() - t0) / 0.3, 1.0)
+        if leaving[0]:
+            return
+        t = min((time.perf_counter() - t0) / 0.45, 1.0)
         e = 1 - (1 - t) ** 3
-        root.geometry(f"{W}x{H}+{fx + int((1 - e) * 70 * sc)}+{fy}")
+        root.geometry(f"{W}x{H}+{fx + int((1 - e) * 64 * sc)}+{fy}")
         root.attributes("-alpha", e)
         if t < 1.0:
-            root.after(10, slide_in)
-
-    def fade_out(a=1.0):
-        if a <= 0:
-            root.destroy()
-            return
-        root.attributes("-alpha", a)
-        root.after(15, fade_out, a - 0.12)
+            root.after(8, slide_in)
 
     def tick():
+        if leaving[0]:
+            return
         if not paused[0]:
             left[0] -= 0.03
         if left[0] <= 0:
-            fade_out()
+            leave()
             return
         cv.coords(bar, bx, by, bx + max(1, int(bl * left[0] / 5.0)), by)
         root.after(30, tick)
@@ -1223,9 +1239,9 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.0.1"          # bump this before every release build, and tag the release the same (v1.0.1)
+APP_VERSION = "1.1.0"          # bump this before every release build, and tag the release the same (v1.0.1)
 UPDATE_REPO = "ahhmilo/Helpy"
-FORCE_UPDATE = True           # True: the prompt only offers "Update now" or "Exit Helpy" (no "Later")
+FORCE_UPDATE = True            # True: the prompt only offers "Update now" or "Exit Helpy" (no "Later"), and the startup check can't be turned off
 UPD = {"info": None, "busy": False}
 
 
@@ -1559,7 +1575,7 @@ class Api:
         quit_app()
 
     def app_info(self):
-        return {"version": APP_VERSION, "exe": IS_EXE}
+        return {"version": APP_VERSION, "exe": IS_EXE, "force": FORCE_UPDATE}
 
     def check_update(self):
         return fetch_update_info()
@@ -1752,12 +1768,12 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.15)}
 :root{--hv:rgba(255,255,255,.09)}
 @media(prefers-color-scheme:light){:root{--hv:rgba(0,0,0,.06)}}
 /* hover polish */
-.sg{border-radius:8px;transition:color .2s,background .25s}.sg:not(.on):hover{color:var(--tx);background:var(--hv)}
+.sg{isolation:isolate;transition:color .2s}.sg::before{content:'';position:absolute;inset:5px 14px;border-radius:7px;background:var(--hv);opacity:0;transform:scale(.92);transition:opacity .25s,transform .3s var(--spring);z-index:-1}.sg:not(.on):hover{color:var(--tx)}.sg:not(.on):hover::before{opacity:.8;transform:none}
 .chip,.mod,.btn.sec{transition:background .25s,color .25s,transform .25s var(--spring),box-shadow .25s,filter .2s}
 .chip:not(.on):hover,.mod:not(.on):hover,.btn.sec:hover{box-shadow:inset 0 0 0 99px var(--hv)}
 .btn.sec.del:hover{box-shadow:none}
 .row{transition:background .2s}.row:hover{background:var(--hv)}
-.sw:hover i{filter:brightness(1.12)}.sw i{transition:background .25s,filter .2s}
+.sw input:not(:checked):hover+i{filter:brightness(1.12)}.sw input:checked:hover+i{background:color-mix(in srgb,var(--ok) 78%,#000)}.sw i{transition:background .25s,filter .2s}
 .x:hover{background:var(--hv)}
 .wb:active{transform:scale(.9)}.wb{transition:background .2s,color .2s,transform .2s var(--spring)}
 #top svg{transition:transform .3s var(--spring)}#top:hover svg{transform:translateY(-2px)}
@@ -1793,6 +1809,25 @@ body.lite #lbi,body.lite #toast,body.lite .nv,body.lite #top,body.lite #edbox,bo
 .us{min-height:18px;font-size:13px;color:var(--mu);margin-bottom:12px}.us.bad{color:var(--bad)}
 .ubtns{display:flex;gap:10px}.ubtns .btn{flex:1}.ubtns .btn[disabled]{opacity:.5;pointer-events:none}
 body.lite #upd{-webkit-backdrop-filter:none;backdrop-filter:none}
+
+/* blue buttons: lighter fill + lift + glow on hover, press-in on click */
+.btn{transition:transform .28s var(--spring),box-shadow .28s,background .22s,filter .2s}
+.btn:not(.sec):hover{filter:none;background:color-mix(in srgb,var(--ac) 80%,#000)}
+.btn:not(.sec):active{transform:scale(.96);background:color-mix(in srgb,var(--ac) 68%,#000)}
+.chip.on:hover,.mod.on:hover{background:color-mix(in srgb,var(--ac) 80%,#000)}
+.btn.sec:active{transform:scale(.96)}
+/* text boxes: smooth focus ring + a little pulse on every keystroke */
+.form input,#edhex,input[type=text],input[type=number]{caret-color:var(--ac);transition:box-shadow .25s,background .25s,border-color .25s}
+.form input:focus,input[type=text]:focus,input[type=number]:focus{box-shadow:0 0 0 3px color-mix(in srgb,var(--ac) 32%,transparent)}
+body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]{caret-color:transparent}
+#scar{position:fixed;left:0;top:0;width:2px;border-radius:2px;background:var(--ac);z-index:200;pointer-events:none;display:none;transition:transform .14s cubic-bezier(.2,.8,.2,1)}
+#scar.jump{transition:none}#scar.blink{animation:scarb 1.1s ease-in-out infinite}
+@keyframes scarb{0%,45%{opacity:1}65%,90%{opacity:.1}100%{opacity:1}}
+#smeas{position:fixed;left:-9999px;top:-9999px;visibility:hidden;white-space:pre}
+@keyframes shake{20%{transform:translateX(-5px)}40%{transform:translateX(5px)}60%{transform:translateX(-3px)}80%{transform:translateX(3px)}}
+.shake{animation:shake .35s}
+/* viewer image no longer acts like a button */
+#lbi,.lbwrap.actual #lbi{cursor:default}
 </style></head><body>
 <div id="app">
  <header>
@@ -2038,7 +2073,7 @@ function renderKeys(){
 async function saveST(){ST.enabled=$('sen').checked;ST=await api().set_settings(ST);renderKeys()}
 function mod(k,m){ST[k][m]=!ST[k][m];saveST()}
 function capKey(k){CAPK=k;const b=document.querySelector(`#krow_${k} .key`);b.textContent='Press a key…';b.classList.add('cap')}
-function renderSet(){renderSnd();$('s_lite').checked=!!ST.lite;$('s_auto').checked=ST.auto_update!==false;applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
+function renderSet(){renderSnd();$('s_lite').checked=!!ST.lite;$('s_auto').checked=ST.auto_update!==false||FORCEUPD;$('s_auto').disabled=FORCEUPD;applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
 async function saveSet(){
  ST.lite=$('s_lite').checked;ST.auto_update=$('s_auto').checked;ST.game_mode=$('s_game').checked;ST.notify=$('s_notify').checked;ST.sound=$('s_snd').checked;ST.volume=+$('s_vol').value;ST.quiet_fullscreen=$('s_quiet').checked;ST.sound_fs_only=$('s_fsonly').checked;
  await api().set_startup($('s_start').checked);ST=await api().set_settings(ST);renderKeys()}
@@ -2068,7 +2103,7 @@ document.addEventListener('keydown',async e=>{
 async function chooseFolder(){ST=await api().pick_folder();renderKeys();galleryRefresh()}
 async function galleryRefresh(){
  G=await api().gallery_list();setBadge(G.unseen);
- $('gsub').textContent=`${G.items.length} screenshot${G.items.length==1?'':'s'} in ${G.folder}`;renderGrid()}
+ $('gsub').textContent=`${G.items.length} screenshot${G.items.length==1?'':'s'}`;renderGrid()}
 function renderGrid(){
  const g=$('grid');
  if(!G.items.length){g.innerHTML=`<div class="empty" style="grid-column:1/-1">No screenshots yet. Press ${esc(combo(ST.region))} to take one.</div>`;return}
@@ -2079,13 +2114,22 @@ function renderGrid(){
   try{e.target.querySelector('img').src=await api().thumb(G.items[+e.target.dataset.i].path);e.target.classList.add('ld')}catch(_){}
  }),{root:$('gmain'),rootMargin:'400px'});
  g.querySelectorAll('.tile').forEach(t=>IO.observe(t))}
-async function openLB(i){
+async function openLB(i,dir){
  if(LBA)setActual(false);LB=i;const x=G.items[i];
  if(x.new){x.new=false;const t=document.querySelector(`.tile[data-i="${i}"]`);if(t)t.classList.remove('new');api().mark_seen(x.path).then(setBadge)}$('lbn').textContent=x.name;$('lb').classList.add('show');syncModal();lbNavUi();zoomReset(true);
  $('lbdel').textContent='Delete';clearTimeout(DELT);DELT=null;
- const src=await api().full(x.path);if(LB==i)$('lbi').src=src}
+ const im=$('lbi'),pr=api().full(x.path);
+ if(dir&&!LITE&&im.src&&im.complete){
+  const out=im.animate([{opacity:1,transform:'translateX(0)'},{opacity:0,transform:`translateX(${-dir*56}px) scale(.98)`}],{duration:150,easing:'ease-in',fill:'forwards'});
+  const [src]=await Promise.all([pr,out.finished.catch(()=>0)]);
+  if(LB!=i){out.cancel();return}
+  im.src=src;try{await im.decode()}catch(e){}
+  if(LB!=i){out.cancel();return}
+  out.cancel();
+  im.animate([{opacity:0,transform:`translateX(${dir*56}px) scale(.98)`},{opacity:1,transform:'translateX(0) scale(1)'}],{duration:380,easing:'cubic-bezier(.2,.8,.2,1)'});
+ }else{const src=await pr;if(LB==i)im.src=src}}
 function closeLB(){if(LBF)lbFull();setActual(false);zoomReset(true);LB=-1;syncModal();$('lb').classList.remove('show')}
-function lbGo(d){if(LB<0)return;const n=LB+d;if(n>=0&&n<G.items.length)openLB(n)}
+function lbGo(d){if(LB<0)return;const n=LB+d;if(n>=0&&n<G.items.length)openLB(n,d)}
 async function lbCopy(){await api().copy_image(G.items[LB].path);toast('Copied to clipboard')}
 function lbShow(){api().reveal(G.items[LB].path)}
 async function lbDel(){
@@ -2093,7 +2137,7 @@ async function lbDel(){
  if(!DELT){b.textContent='Click again to delete';DELT=setTimeout(()=>{DELT=null;b.textContent='Delete'},3000);return}
  clearTimeout(DELT);DELT=null;b.textContent='Delete';
  setBadge(await api().delete_shot(G.items[LB].path));G.items.splice(LB,1);
- $('gsub').textContent=`${G.items.length} screenshot${G.items.length==1?'':'s'} in ${G.folder}`;renderGrid();
+ $('gsub').textContent=`${G.items.length} screenshot${G.items.length==1?'':'s'}`;renderGrid();
  if(!G.items.length)closeLB();else openLB(Math.min(LB,G.items.length-1));toast('Moved to Recycle Bin')}
 async function openShot(path){
  if(ED)edCancel(true);
@@ -2104,8 +2148,8 @@ document.addEventListener('keydown',e=>{
 document.addEventListener('keydown',e=>{if(!open())return;if(e.key=='Enter')keep();if(e.key=='Escape')undo()});
 $('q').oninput=renderList;
 window.addEventListener('pywebviewready',async()=>{ST=await api().get_settings();applyLite();renderKeys();refresh(true);api().unseen_count().then(setBadge);
- api().app_info().then(i=>{$('s_ver').textContent='v'+i.version});
- if(ST.auto_update!==false)setTimeout(()=>checkUpd(false),3000)});
+ api().app_info().then(i=>{FORCEUPD=!!i.force;$('s_ver').textContent='v'+i.version;renderSet();
+  if(ST.auto_update!==false||FORCEUPD){setTimeout(()=>checkUpd(false),3000);setInterval(()=>{if(!$('upd').classList.contains('show'))checkUpd(false)},6*3600*1000)}})});
 
 /* ---- maximize ---- */
 async function maxi(){setMax(await api().toggle_maximize())}
@@ -2137,7 +2181,7 @@ function parseCol(t){t=t.trim().toLowerCase();
  if(m){const v=[m[1],m[2],m[3]].map(Number);if(v.every(n=>n<=255))return '#'+v.map(n=>n.toString(16).padStart(2,'0')).join('')}
  return null}
 function edHex(t,typing){const c=parseCol(t),el=$('edhex');
- if(c){edColor(c,typing)}else{el.classList.toggle('bad',!typing&&t.trim()!=='');if(!typing&&t.trim()!==''){toast('Use a hex like #ff8800 or rgb like 255, 136, 0',true);el.value=ED?ED.color:'#000000';el.classList.remove('bad')}}}
+ if(c){edColor(c,typing)}else{el.classList.toggle('bad',!typing&&t.trim()!=='');if(!typing&&t.trim()!==''){toast('Use a hex like #ff8800 or rgb like 255, 136, 0',true);el.value=ED?ED.color:'#000000';el.classList.remove('bad');el.classList.remove('shake');void el.offsetWidth;el.classList.add('shake')}}}
 function edPrev(){const i=document.querySelector('#edprev i');if(!i||!ED)return;const d=Math.round(4+(ED.size/150)*32);i.style.width=i.style.height=d+'px';i.style.background=ED.color}
 function edSize(){const r=$('edsize'),v=+r.value;$('edsizen').textContent=v;r.style.setProperty('--p',((v-2)/148*100)+'%');if(ED){ED.size=v;edPrev();const c=$('edcur');c.style.width=c.style.height=v+'px'}}
 function edPush(){ED.hist.push(ED.ctx.getImageData(0,0,ED.cv.width,ED.cv.height));if(ED.hist.length>15)ED.hist.shift();edUi()}
@@ -2246,7 +2290,7 @@ $('lb').addEventListener('wheel',e=>{
   Z.x=Math.max(-mx,Math.min(mx,st.zx+dx));Z.y=Math.max(-my,Math.min(my,st.zy+dy));zApply()});
  const end=()=>{if(!st)return;i.classList.remove('drag');if(st.moved)LASTDRAG=performance.now();st=null};
  i.addEventListener('pointerup',end);i.addEventListener('pointercancel',end);
- i.addEventListener('click',()=>{if(performance.now()-LASTDRAG<250)return;if(Z.s>1.001){zoomReset();return}setActual(!LBA)})})();
+})();
 /* ---- click outside the screenshot = Esc ---- */
 let LBD=null;
 const lbBg=t=>t&&(t.id=='lb'||(t.classList&&(t.classList.contains('lbwrap')||t.classList.contains('lbbar')))||(t.tagName=='SPAN'&&t.parentElement&&t.parentElement.classList.contains('lbbar')));
@@ -2254,7 +2298,7 @@ $('lb').addEventListener('mousedown',e=>{LBD=e.target});
 $('lb').addEventListener('click',e=>{if(ED||LB<0)return;if(lbBg(e.target)&&lbBg(LBD)){if(LBF)lbFull();else closeLB()}});
 
 /* ---- updater ---- */
-var UI_UPD=null;
+var UI_UPD=null,FORCEUPD=false;
 function updShow(r){
  UI_UPD=r;$('uv').textContent=`v${r.current}  →  v${r.version}`;
  $('un').textContent=r.notes||'';$('un').style.display=r.notes?'':'none';
@@ -2286,6 +2330,36 @@ async function checkUpd(manual){
   if(LB>=0||ED){toast(`Helpy ${r.version} is available. Open Settings to update.`);return}
   updShow(r)}
  else if(manual)$('s_updmsg').textContent=`You're on the latest version (v${r.current}).`}
+
+/* ---- smooth typing caret: glides to where the text cursor is when you type, delete or move ---- */
+(function(){
+ const car=document.createElement('div');car.id='scar';
+ const meas=document.createElement('span');meas.id='smeas';
+ document.body.append(car,meas);
+ let raf=0,last=null;
+ const ok=t=>t&&t.tagName=='INPUT'&&/^(text|search|)$/.test(t.type||'')&&t.selectionStart!=null;
+ const hide=()=>{car.style.display='none';last=null};
+ function place(){
+  raf=0;document.body.classList.toggle('smoothcar',!LITE);
+  const t=document.activeElement;
+  if(LITE||!ok(t)||t.selectionStart!==t.selectionEnd){hide();return}
+  const cs=getComputedStyle(t),r=t.getBoundingClientRect();
+  if(!r.width){hide();return}
+  meas.style.font=cs.font;meas.style.letterSpacing=cs.letterSpacing;meas.textContent=t.value.slice(0,t.selectionStart);
+  const bl=parseFloat(cs.borderLeftWidth)||0,br=parseFloat(cs.borderRightWidth)||0,pl=parseFloat(cs.paddingLeft)||0,pr=parseFloat(cs.paddingRight)||0;
+  const x=r.left+bl+pl+meas.getBoundingClientRect().width-t.scrollLeft;
+  if(x<r.left+bl+pl-1||x>r.right-br-pr+1){hide();return}
+  const h=Math.round(parseFloat(cs.fontSize)*1.3),y=r.top+r.height/2-h/2,fresh=last!==t;
+  car.style.height=h+'px';
+  if(fresh)car.classList.add('jump');
+  car.style.transform=`translate(${x-1}px,${y}px)`;car.style.display='block';
+  if(fresh){void car.offsetWidth;car.classList.remove('jump');last=t}
+  car.classList.remove('blink');void car.offsetWidth;car.classList.add('blink')}
+ const sched=()=>{if(!raf)raf=requestAnimationFrame(place)};
+ ['focusin','focusout','input','keydown','keyup','mousedown','mouseup','select','scroll'].forEach(ev=>
+  document.addEventListener(ev,e=>{if(ev=='focusin'||ev=='focusout'||ok(e.target))sched()},true));
+ document.addEventListener('selectionchange',sched);window.addEventListener('resize',sched);
+})();
 </script></body></html>
 """
 

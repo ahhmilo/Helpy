@@ -325,6 +325,10 @@ DEF_SETTINGS = {
     "notify": True,
     "lite": False,
     "auto_update": True,
+    "theme": "auto",
+    "gallery_sort": "new",
+    "img_format": "png",
+    "img_quality": 92,
     "sound": True,
     "volume": 50,
     "quiet_fullscreen": False,
@@ -421,14 +425,28 @@ def copy_to_clipboard(img):
         user32.CloseClipboard()
 
 
+def save_image(img, path, fmt="png", quality=92):
+    """Writes img as png / jpg / webp. JPG and WebP have no alpha, so they're flattened to RGB."""
+    if fmt == "jpg":
+        img.convert("RGB").save(path, "JPEG", quality=quality, optimize=True, subsampling=0 if quality >= 90 else 2)
+    elif fmt == "webp":
+        img.convert("RGB").save(path, "WEBP", quality=quality, method=4)
+    else:
+        img.save(path, "PNG")
+
+
 def save_shot(img, folder):
     os.makedirs(folder, exist_ok=True)
+    cfg = load_settings()
+    fmt = cfg.get("img_format", "png")
+    fmt = fmt if fmt in ("png", "jpg", "webp") else "png"
+    ext = "." + fmt
     base = datetime.datetime.now().strftime("Screenshot %Y-%m-%d %H-%M-%S")
-    path, n = os.path.join(folder, base + ".png"), 2
+    path, n = os.path.join(folder, base + ext), 2
     while os.path.exists(path):  # two shots in the same second get " (2)"
-        path = os.path.join(folder, f"{base} ({n}).png")
+        path = os.path.join(folder, f"{base} ({n}){ext}")
         n += 1
-    img.save(path, "PNG")
+    save_image(img, path, fmt, int(cfg.get("img_quality", 92)))
     return path
 
 
@@ -1239,7 +1257,7 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.1.0"          # bump this before every release build, and tag the release the same (v1.0.1)
+APP_VERSION = "1.2.0"          # bump this before every release build, and tag the release the same (v1.0.1)
 UPDATE_REPO = "ahhmilo/Helpy"
 FORCE_UPDATE = True            # True: the prompt only offers "Update now" or "Exit Helpy" (no "Later"), and the startup check can't be turned off
 UPD = {"info": None, "busy": False}
@@ -1367,6 +1385,25 @@ def clean_old_update():
             os.remove(os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "Helpy.update.exe"))
         except OSError:
             pass
+def fetch_changelog():
+    """The last few GitHub releases, newest first."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{UPDATE_REPO}/releases?per_page=12",
+            headers={"User-Agent": f"Helpy/{APP_VERSION}", "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            j = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return {"ok": False, "msg": "Couldn't load the changelog. Check your connection and try again."}
+    items = []
+    for r in j if isinstance(j, list) else []:
+        if r.get("draft"):
+            continue
+        tag = str(r.get("tag_name", ""))
+        items.append({"tag": tag, "date": str(r.get("published_at") or "")[:10],
+                      "body": str(r.get("body") or "").strip()[:3000], "current": _ver(tag) == _ver(APP_VERSION)})
+    return {"ok": True, "items": items}
 # --- end updater -----------------------------------------------------------
 
 
@@ -1389,6 +1426,13 @@ class Api:
         cur["notify"] = bool(s.get("notify", True))
         cur["lite"] = bool(s.get("lite", False))
         cur["auto_update"] = bool(s.get("auto_update", True))
+        cur["theme"] = s.get("theme") if s.get("theme") in ("auto", "light", "dark") else "auto"
+        cur["gallery_sort"] = s.get("gallery_sort") if s.get("gallery_sort") in ("new", "old", "az", "za", "big") else "new"
+        cur["img_format"] = s.get("img_format") if s.get("img_format") in ("png", "jpg", "webp") else "png"
+        try:
+            cur["img_quality"] = max(50, min(100, int(s.get("img_quality", 92))))
+        except (TypeError, ValueError):
+            cur["img_quality"] = 92
         cur["sound"] = bool(s.get("sound", True))
         cur["volume"] = max(0, min(100, int(s.get("volume", 50))))
         cur["quiet_fullscreen"] = bool(s.get("quiet_fullscreen", False))
@@ -1420,7 +1464,7 @@ class Api:
             for f in os.scandir(folder):
                 if f.is_file() and f.name.lower().endswith(IMG_EXT):
                     st = f.stat()
-                    items.append({"name": f.name, "path": f.path, "mtime": st.st_mtime, "new": _nk(f.path) in unseen})
+                    items.append({"name": f.name, "path": f.path, "mtime": st.st_mtime, "size": st.st_size, "new": _nk(f.path) in unseen})
         except FileNotFoundError:
             pass
         items.sort(key=lambda x: -x["mtime"])
@@ -1455,6 +1499,18 @@ class Api:
         recycle(_safe(path))
         remove_unseen(path)
         return update_badge(False)
+
+    def delete_shots(self, paths):
+        for p in paths:
+            try:
+                recycle(_safe(p))
+                remove_unseen(p)
+            except Exception:
+                pass
+        return update_badge(False)
+
+    def get_changelog(self):
+        return fetch_changelog()
 
     def pick_sound(self):
         import shutil
@@ -1523,7 +1579,7 @@ class Api:
         return reset_color(dev)
 
     def minimize(self):
-        WINDOW.hide()  # goes to tray
+        WINDOW.minimize()  # normal minimize to the taskbar
 
     def toggle_maximize(self):
         if FULL_STATE[0]:
@@ -1553,26 +1609,31 @@ class Api:
         im.load()
         folder, name = os.path.split(p)
         stem, ext = os.path.splitext(name)
-        if overwrite:
+        cfg = load_settings()
+        q = int(cfg.get("img_quality", 92))
+        if overwrite:  # same file, same format
             out = p
-            fmt = {".jpg": "JPEG", ".jpeg": "JPEG", ".bmp": "BMP", ".webp": "WEBP"}.get(ext.lower(), "PNG")
-        else:
-            out, n = os.path.join(folder, f"{stem} (edited).png"), 2
+            fmt = {".jpg": "jpg", ".jpeg": "jpg", ".webp": "webp"}.get(ext.lower(), "png")
+            if ext.lower() == ".bmp":
+                im.convert("RGB").save(out, "BMP")
+                remove_unseen(out)
+                return out
+        else:  # a copy uses the format chosen in Settings
+            fmt = cfg.get("img_format", "png")
+            fmt = fmt if fmt in ("png", "jpg", "webp") else "png"
+            out, n = os.path.join(folder, f"{stem} (edited).{fmt}"), 2
             while os.path.exists(out):
-                out = os.path.join(folder, f"{stem} (edited {n}).png")
+                out = os.path.join(folder, f"{stem} (edited {n}).{fmt}")
                 n += 1
-            fmt = "PNG"
-        if fmt in ("JPEG", "BMP"):
-            im = im.convert("RGB")
-        if fmt == "JPEG":
-            im.save(out, fmt, quality=95)
-        else:
-            im.save(out, fmt)
+        save_image(im, out, fmt, q)
         remove_unseen(out)
         return out
 
     def close(self):
-        quit_app()
+        WINDOW.hide()  # the X button keeps Helpy running in the tray
+
+    def exit(self):
+        quit_app()  # really quits (tray menu -> Quit Helpy, or the forced-update prompt)
 
     def app_info(self):
         return {"version": APP_VERSION, "exe": IS_EXE, "force": FORCE_UPDATE}
@@ -1759,7 +1820,7 @@ input[type=range]:active::-webkit-slider-thumb{transform:scale(1.15)}
 #edhex:focus{border-color:var(--ac)}#edhex.bad{border-color:var(--bad)}.edbar label{font-size:12px;color:#c7c7cc;display:flex;align-items:center;gap:6px}
 #edstage{flex:1;min-height:0;display:grid;place-items:center;padding:0 24px 24px;overflow:hidden}
 #edbox{position:relative;display:inline-block;line-height:0;box-shadow:0 20px 60px #000a;touch-action:none}
-#edcv{max-width:calc(100vw - 48px);max-height:calc(100vh - 48px - 74px - 24px);cursor:crosshair;background:
+#edcv{max-width:calc(100vw - 48px);max-height:calc(100vh - 240px);cursor:crosshair;background:
  conic-gradient(#555 25%,#444 0 50%,#555 0 75%,#444 0) 0 0/16px 16px}
 #edsel{position:absolute;display:none;border:2px solid var(--ac);box-shadow:0 0 0 9999px rgba(0,0,0,.55);pointer-events:none}
 #edsel.show{display:block}
@@ -1828,15 +1889,64 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
 .shake{animation:shake .35s}
 /* viewer image no longer acts like a button */
 #lbi,.lbwrap.actual #lbi{cursor:default}
+
+/* ---- theme override (Auto = follow Windows) ---- */
+:root[data-theme=dark]{color-scheme:dark;--bg:#1c1c1e;--card:#2c2c2e;--card2:#3a3a3c;--sep:rgba(255,255,255,.08);--tx:#f5f5f7;--mu:#98989f;--ac:#0a84ff;--ok:#30d158;--bad:#ff453a;--hv:rgba(255,255,255,.09)}
+:root[data-theme=light]{color-scheme:light;--bg:#f2f2f7;--card:#fff;--card2:#e9e9ee;--sep:rgba(0,0,0,.08);--tx:#1d1d1f;--mu:#6e6e73;--ac:#007aff;--ok:#34c759;--bad:#ff3b30;--hv:rgba(0,0,0,.06)}
+.tflip *:not(.thumb),.tflip *:before,.tflip *:after{transition:background-color .35s,color .35s,border-color .35s,fill .35s,stroke .35s!important}
+/* ---- gallery: search, sort, select ---- */
+.gbar{display:flex;align-items:center;gap:10px;margin:0 0 16px;flex-wrap:wrap}.gbar b{font-weight:600}
+.gsearch{position:relative;flex:1 1 300px;min-width:180px;max-width:340px}
+.gsearch input{width:100%;background:var(--card);border:0;border-radius:11px;padding:9px 34px;outline:0;-webkit-user-select:text;user-select:text}
+.gsearch>svg{position:absolute;left:12px;top:50%;transform:translateY(-50%);color:var(--mu);pointer-events:none}
+.gclr{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:24px;height:24px;border-radius:50%;background:none;color:var(--mu);display:none;place-items:center}
+.gsearch.has .gclr{display:grid}.gclr:hover{background:var(--hv);color:var(--tx)}
+.gsel{-webkit-appearance:none;appearance:none;background:var(--card) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M2.5 4.5L6 8l3.5-3.5' fill='none' stroke='%2398989f' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 11px center;border:0;border-radius:11px;padding:9px 32px 9px 13px;color:var(--tx);cursor:pointer;outline:0;transition:background-color .2s}
+.gsel:hover{background-color:var(--card2)}
+#shots:not(.selmode) .gbar-s{display:none}#shots.selmode .gbar-n{display:none}.gbar-s{animation:fade .3s var(--ease)}
+.btn[disabled]{opacity:.45;pointer-events:none}
+.tile .ck{position:absolute;top:10px;left:10px;width:22px;height:22px;border-radius:50%;border:2px solid #fff;background:rgba(0,0,0,.35);display:none;place-items:center;z-index:2;transition:background .2s,border-color .2s}
+.grid.selmode .tile .ck{display:grid}.grid.selmode .tile:hover{transform:none}
+.tile.pk{outline:3px solid var(--ac);outline-offset:-3px}.tile.pk .ck{background:var(--ac);border-color:var(--ac)}
+.tile.pk .ck:after{content:'';width:5px;height:10px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg) translate(-1px,-1px)}
+/* ---- changelog ---- */
+#clog{display:none;margin-top:12px;max-height:360px;overflow:auto}#clog.open{display:block;animation:fade .3s var(--ease)}
+.cl{background:var(--card2);border-radius:12px;padding:12px 14px;margin-bottom:10px}.cl:last-child{margin-bottom:0}
+.clh{display:flex;align-items:center;gap:10px;margin-bottom:6px}.clh small{color:var(--mu);margin-left:auto}
+.clcur{background:var(--ac);color:#fff;border-radius:99px;padding:2px 9px;font-size:11px;font-weight:600}
+.cl pre{margin:0;white-space:pre-wrap;font-family:inherit;font-size:13px;line-height:1.5;color:var(--mu)}
+/* ---- editor extras ---- */
+#edov{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none}
+#edsel.soft{box-shadow:none;border:2px dashed #fff;background:rgba(255,255,255,.1)}
+#edtxt{position:absolute;display:none;z-index:5;background:transparent;border:1px dashed rgba(255,255,255,.7);outline:0;padding:0 2px;margin:0;min-width:120px;line-height:1.2;font-family:"Segoe UI",system-ui,sans-serif;font-weight:600;box-shadow:none!important;-webkit-user-select:text;user-select:text}
+.edbar.r2{padding-top:0}
+
+/* ---- sort dropdown ---- */
+.dd{position:relative;z-index:30}
+.ddb{display:flex;align-items:center;gap:10px;background:var(--card);border-radius:11px;padding:9px 12px 9px 14px;color:var(--tx);font-weight:500;transition:background-color .2s,box-shadow .25s}
+.ddb:hover{background:var(--card2)}.dd.open .ddb{background:var(--card2);box-shadow:0 0 0 2px color-mix(in srgb,var(--ac) 45%,transparent)}
+.ddb svg{color:var(--mu);transition:transform .35s var(--spring)}.dd.open .ddb svg{transform:rotate(180deg)}
+.ddm{display:none;position:absolute;left:0;top:calc(100% + 8px);min-width:214px;padding:6px;background:var(--card);border:1px solid var(--sep);border-radius:14px;box-shadow:0 18px 50px rgba(0,0,0,.35),0 2px 8px rgba(0,0,0,.2);transform-origin:top left}
+.dd.open .ddm{display:block;animation:ddin .28s var(--spring)}
+.dd.open.out .ddm{animation:ddout .14s ease-in forwards}
+@keyframes ddin{from{opacity:0;transform:translateY(-8px) scale(.94)}to{opacity:1;transform:none}}
+@keyframes ddout{to{opacity:0;transform:translateY(-6px) scale(.97)}}
+.ddh{padding:6px 10px;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--mu)}
+.ddi{display:flex;align-items:center;justify-content:space-between;gap:16px;width:100%;text-align:left;padding:9px 10px;border-radius:9px;background:none;color:var(--tx);transition:background .15s,color .15s}
+.ddi:hover,.ddi:focus-visible{background:var(--hv);outline:0}
+.ddi.on{color:var(--ac);font-weight:600}
+.ddi svg{opacity:0;transform:scale(.5);transition:opacity .2s,transform .35s var(--spring)}.ddi.on svg{opacity:1;transform:none}
+.dd.open .ddi{animation:ddi .32s var(--ease) both;animation-delay:calc(var(--k)*32ms + 50ms)}
+@keyframes ddi{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
 </style></head><body>
 <div id="app">
  <header>
   <div id="drag" class="pywebview-drag-region"><i></i>Helpy</div>
   <div class="seg" id="nav" style="--n:3;--i:0"><div class="thumb"></div><button class="sg on" onclick="page(0)">Display</button><button class="sg" onclick="page(1)">Screenshots<b class="badge" id="badge"></b></button><button class="sg" onclick="page(2)">Settings</button></div>
   <div class="pywebview-drag-region" style="flex:1;height:100%" ondblclick="maxi()"></div>
-  <button class="wb" onclick="mini()" title="Minimize to tray" aria-label="Minimize to tray"><svg width="12" height="12" viewBox="0 0 12 12"><path d="M1 6h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+  <button class="wb" onclick="mini()" title="Minimize" aria-label="Minimize"><svg width="12" height="12" viewBox="0 0 12 12"><path d="M1 6h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
   <button class="wb" id="wmax" onclick="maxi()" title="Maximize" aria-label="Maximize"><svg id="wmaxi" width="12" height="12" viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button>
-  <button class="wb close" onclick="quit()" title="Exit" aria-label="Exit"><svg width="12" height="12" viewBox="0 0 12 12"><path d="M1.5 1.5l9 9m0-9l-9 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
+  <button class="wb close" onclick="api().close()" title="Close to tray" aria-label="Close to tray"><svg width="12" height="12" viewBox="0 0 12 12"><path d="M1.5 1.5l9 9m0-9l-9 9" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
  </header>
  <div id="body" class="page on">
   <main>
@@ -1865,14 +1975,27 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
  <div id="shots" class="page">
   <button id="top" onclick="toTop()" aria-label="Back to top"><svg width="18" height="18" viewBox="0 0 18 18"><path d="M3 11l6-6 6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
   <main id="gmain">
-   <div class="ghead"><div><div class="gt">Screenshots</div><div class="mon" id="gsub"></div></div><div style="display:flex;gap:10px"><button class="btn sec" id="markall" onclick="markAll()" style="display:none">Mark all as seen</button><button class="btn sec" onclick="api().open_folder()">Open folder</button></div></div>
+   <div class="ghead"><div><div class="gt">Screenshots</div><div class="mon" id="gsub"></div></div><div style="display:flex;gap:10px"><button class="btn sec" id="markall" onclick="markAll()" style="display:none">Mark all as seen</button></div></div>
+   <div class="gbar gbar-n">
+    <div class="gsearch" id="gsearch"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input type="text" id="gq" placeholder="Search screenshots" spellcheck="false" oninput="setQuery(this.value)"><button class="gclr" onclick="clearQuery()" aria-label="Clear search"><svg width="10" height="10" viewBox="0 0 12 12"><path d="M1.5 1.5l9 9m0-9l-9 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div>
+    <div class="dd" id="gdd"><button class="ddb" id="gsortb" onclick="ddToggle()" aria-haspopup="listbox" aria-expanded="false"><span id="gsortl">Newest first</span><svg width="12" height="12" viewBox="0 0 12 12"><path d="M2.5 4.5L6 8l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div class="ddm" id="gsortm" role="listbox" onkeydown="ddKey(event)"><div class="ddh">Sort by</div><button class="ddi" role="option" data-v="new" style="--k:0" onclick="ddPick('new')"><span>Newest first</span><svg width="14" height="14" viewBox="0 0 14 14"><path d="M2.5 7.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button class="ddi" role="option" data-v="old" style="--k:1" onclick="ddPick('old')"><span>Oldest first</span><svg width="14" height="14" viewBox="0 0 14 14"><path d="M2.5 7.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button class="ddi" role="option" data-v="az" style="--k:2" onclick="ddPick('az')"><span>Name A to Z</span><svg width="14" height="14" viewBox="0 0 14 14"><path d="M2.5 7.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button class="ddi" role="option" data-v="za" style="--k:3" onclick="ddPick('za')"><span>Name Z to A</span><svg width="14" height="14" viewBox="0 0 14 14"><path d="M2.5 7.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button class="ddi" role="option" data-v="big" style="--k:4" onclick="ddPick('big')"><span>Largest first</span><svg width="14" height="14" viewBox="0 0 14 14"><path d="M2.5 7.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div></div>
+    <span style="flex:1"></span>
+    <button class="btn sec" onclick="setSel(true)">Select</button>
+    <button class="btn sec" onclick="api().open_folder()">Open folder</button>
+   </div>
+   <div class="gbar gbar-s"><b id="selcount">Select screenshots</b><span style="flex:1"></span><button class="btn sec" onclick="selAll()">Select all</button><button class="btn sec del" id="seldel" onclick="delSel()" disabled>Delete</button><button class="btn" onclick="setSel(false)">Done</button></div>
    <div class="grid" id="grid"></div>
   </main>
   <aside>
    <h3>Save location</h3>
    <div class="grp"><div class="pre" style="cursor:default"><div style="min-width:0"><b>Folder</b><small id="sfolder" style="word-break:break-all"></small></div></div></div>
    <div class="form" style="margin-top:10px"><button class="btn sec full" onclick="chooseFolder()">Choose folder</button></div>
-   <h3>Shortcuts</h3>
+   <h3>Saved images</h3>
+   <div class="grp" style="max-width:640px">
+    <div class="sl"><div><span>Format</span></div><div class="seg" id="fmtSeg" style="display:grid;--n:3;--i:0;margin:10px 0 0"><div class="thumb"></div><button class="sg on" onclick="setFmt('png')">PNG</button><button class="sg" onclick="setFmt('jpg')">JPG</button><button class="sg" onclick="setFmt('webp')">WebP</button></div><p class="note" id="fmtnote" style="margin:10px 0 0"></p></div>
+    <div class="sl" id="qrow"><div><span>Quality</span><output id="o_q"></output></div><input type="range" id="s_q" min="50" max="100" step="1" oninput="qLive(this)" onchange="setQ(this.value)"></div>
+   </div>
+   <h3 style="margin-top:22px">Shortcuts</h3>
    <div class="grp">
     <div class="sl"><div><span>Enable shortcuts</span><label class="sw"><input type="checkbox" id="sen" onchange="saveST()"><i></i></label></div></div>
     <div class="sl" id="krow_region"></div>
@@ -1900,6 +2023,10 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
     <div class="sl"><div><span>Sound</span><output id="s_sname"></output></div><div class="kr"><button class="mod" onclick="testSound()">Play</button><button class="mod" onclick="pickSound()">Choose file…</button><button class="mod" onclick="resetSound()">Use default</button></div></div>
     <div class="sl"><div><span>Fullscreen apps: stay silent</span><label class="sw"><input type="checkbox" id="s_quiet" onchange="snd('quiet')"><i></i></label></div><p class="note" style="margin:8px 0 0">No sound while a game or other fullscreen app has focus. There is never a popup there either, so you get no feedback at all, but the shot is still copied and saved.</p></div>
    </div>
+   <h3 style="margin-top:22px">Appearance</h3>
+   <div class="grp" style="max-width:640px">
+    <div class="sl"><div><span>Theme</span></div><div class="seg" id="themeSeg" style="display:grid;--n:3;--i:0;margin:10px 0 0"><div class="thumb"></div><button class="sg on" onclick="setTheme('auto')">Auto</button><button class="sg" onclick="setTheme('light')">Light</button><button class="sg" onclick="setTheme('dark')">Dark</button></div><p class="note" style="margin:10px 0 0">Auto follows your Windows light/dark setting. Pick Light or Dark to override it.</p></div>
+   </div>
    <h3 style="margin-top:22px">Performance</h3>
    <div class="grp" style="max-width:640px">
     <div class="sl"><div><span>Low-end mode</span><label class="sw"><input type="checkbox" id="s_lite" onchange="saveSet()"><i></i></label></div><p class="note" style="margin:8px 0 0">Turns off animations, transitions, smooth scrolling and blur effects. Helps on older or slower PCs.</p></div>
@@ -1908,6 +2035,10 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
    <div class="grp" style="max-width:640px">
     <div class="sl"><div><span>Helpy <b id="s_ver"></b></span><button class="mod" id="s_updbtn" onclick="checkUpd(true)">Check for updates</button></div><p class="note" id="s_updmsg" style="margin:8px 0 0"></p></div>
     <div class="sl"><div><span>Check for updates when Helpy starts</span><label class="sw"><input type="checkbox" id="s_auto" onchange="saveSet()"><i></i></label></div></div>
+   </div>
+   <h3 style="margin-top:22px">Changelog</h3>
+   <div class="grp" style="max-width:640px">
+    <div class="sl"><div><span>What's new in each version</span><button class="mod" id="clogbtn" onclick="toggleClog()">Show changelog</button></div><div id="clog"></div></div>
    </div>
   </main>
  </div>
@@ -1929,9 +2060,20 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
 <div id="ed">
  <div class="edbar">
   <button class="btn sec on" id="t_brush" onclick="edTool('brush')">Brush</button>
+  <button class="btn sec" id="t_hl" onclick="edTool('hl')" title="Semi-transparent marker">Highlighter</button>
+  <button class="btn sec" id="t_arrow" onclick="edTool('arrow')">Arrow</button>
+  <button class="btn sec" id="t_rect" onclick="edTool('rect')">Box</button>
+  <button class="btn sec" id="t_text" onclick="edTool('text')">Text</button>
+  <button class="btn sec" id="t_pixel" onclick="edTool('pixel')" title="Drag a box to pixelate it">Pixelate</button>
+  <button class="btn sec" id="t_blur" onclick="edTool('blur')" title="Drag a box to blur it">Blur</button>
   <button class="btn sec" id="t_crop" onclick="edTool('crop')">Crop</button>
   <button class="btn sec" id="t_pick" onclick="edTool('pick')" title="Click the image to pick a color from it">Pick color</button>
   <span class="sep"></span>
+  <button class="btn sec" id="edfill" onclick="edToggleFill()" style="display:none">Filled</button>
+  <button class="btn sec" id="edapply" onclick="edApplyCrop()" disabled>Apply crop</button>
+  <button class="btn sec" id="edundo" onclick="edUndo()" disabled>Undo</button>
+ </div>
+ <div class="edbar r2">
   <input type="color" id="edcol" value="#000000" title="Color picker" oninput="edColor(this.value)">
   <input type="text" id="edhex" value="#000000" spellcheck="false" placeholder="#hex or rgb" title="Type a hex (#ff8800) or rgb (255, 136, 0) color" oninput="edHex(this.value,true)" onchange="edHex(this.value)" onkeydown="if(event.key=='Enter'){edHex(this.value);this.blur()}">
   <button class="sw8" style="background:#000" onclick="edColor('#000000')"></button>
@@ -1940,16 +2082,13 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
   <button class="sw8" style="background:#ffd60a" onclick="edColor('#ffd60a')"></button>
   <button class="sw8" style="background:#30d158" onclick="edColor('#30d158')"></button>
   <button class="sw8" style="background:#0a84ff" onclick="edColor('#0a84ff')"></button>
-  <label>Size <input type="range" id="edsize" min="2" max="150" value="28" oninput="edSize()"><span id="edsizen" style="width:28px">28</span><span id="edprev"><i></i></span></label>
-  <span class="sep"></span>
-  <button class="btn sec" id="edapply" onclick="edApplyCrop()" disabled>Apply crop</button>
-  <button class="btn sec" id="edundo" onclick="edUndo()" disabled>Undo</button>
+  <label title="Brush size, line thickness, text size or pixel/blur strength, depending on the tool">Size <input type="range" id="edsize" min="2" max="150" value="28" oninput="edSize()"><span id="edsizen" style="width:28px">28</span><span id="edprev"><i></i></span></label>
   <span style="flex:1"></span>
   <button class="btn sec" onclick="edCancel()">Cancel</button>
   <button class="btn sec" id="edow" onclick="edSave(true)">Overwrite</button>
   <button class="btn" onclick="edSave(false)">Save copy</button>
  </div>
- <div id="edstage"><div id="edbox"><canvas id="edcv"></canvas><div id="edsel"></div></div></div>
+ <div id="edstage"><div id="edbox"><canvas id="edcv"></canvas><canvas id="edov"></canvas><div id="edsel"></div><input type="text" id="edtxt" spellcheck="false" onkeydown="edTxtKey(event)" onblur="edTxtBlur()"></div></div>
 </div>
 <div id="edcur"></div>
 <div id="ov"><div class="box">
@@ -2018,7 +2157,7 @@ async function undo(){
  clearInterval(TM);$('ov').classList.remove('show');
  if(PREV)await api().revert(PDEV,PREV);PREV=null;await refresh(false);toast('Reverted')}
 function mini(){if(!open())api().minimize()}
-function quit(){api().close()}
+function quit(){api().exit()}
 const CH=[['vibrance','Digital vibrance',0,100,1,''],['gamma','Gamma',.3,2.8,.01,''],['brightness','Brightness',-50,50,1,''],['contrast','Contrast',50,150,1,''],['r','Red',50,100,1,'r'],['g','Green',50,100,1,'g'],['b','Blue',50,100,1,'b']];
 const PCT=['vibrance','contrast','r','g','b'];
 const fmt=(k,v)=>k=='gamma'?(+v).toFixed(2):k=='brightness'?(v>0?'+':'')+v:v+(PCT.includes(k)?'%':'');
@@ -2073,7 +2212,7 @@ function renderKeys(){
 async function saveST(){ST.enabled=$('sen').checked;ST=await api().set_settings(ST);renderKeys()}
 function mod(k,m){ST[k][m]=!ST[k][m];saveST()}
 function capKey(k){CAPK=k;const b=document.querySelector(`#krow_${k} .key`);b.textContent='Press a key…';b.classList.add('cap')}
-function renderSet(){renderSnd();$('s_lite').checked=!!ST.lite;$('s_auto').checked=ST.auto_update!==false||FORCEUPD;$('s_auto').disabled=FORCEUPD;applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
+function renderSet(){renderSnd();applyTheme();renderFmt();$('s_lite').checked=!!ST.lite;$('s_auto').checked=ST.auto_update!==false||FORCEUPD;$('s_auto').disabled=FORCEUPD;applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
 async function saveSet(){
  ST.lite=$('s_lite').checked;ST.auto_update=$('s_auto').checked;ST.game_mode=$('s_game').checked;ST.notify=$('s_notify').checked;ST.sound=$('s_snd').checked;ST.volume=+$('s_vol').value;ST.quiet_fullscreen=$('s_quiet').checked;ST.sound_fs_only=$('s_fsonly').checked;
  await api().set_startup($('s_start').checked);ST=await api().set_settings(ST);renderKeys()}
@@ -2088,7 +2227,7 @@ async function testSound(){await saveSet();api().test_sound()}
 async function pickSound(){ST=await api().pick_sound();renderKeys()}
 async function resetSound(){ST=await api().reset_sound();renderKeys()}
 function setBadge(n){const b=$('badge');b.textContent=n>99?'99+':n;b.classList.toggle('on',n>0);$('markall').style.display=n>0?'':'none'}
-async function markAll(){setBadge(await api().mark_all_seen());G.items.forEach(x=>x.new=false);document.querySelectorAll('.tile.new').forEach(t=>t.classList.remove('new'))}
+async function markAll(){setBadge(await api().mark_all_seen());(G.all||G.items).forEach(x=>x.new=false);document.querySelectorAll('.tile.new').forEach(t=>t.classList.remove('new'))}
 function snd(w){if(w=='fs'&&$('s_fsonly').checked)$('s_quiet').checked=false;if(w=='quiet'&&$('s_quiet').checked)$('s_fsonly').checked=false;saveSet()}
 function toTop(){animScroll($('gmain'),0)}
 $('gmain').addEventListener('scroll',()=>$('top').classList.toggle('show',$('gmain').scrollTop>400));
@@ -2101,19 +2240,57 @@ document.addEventListener('keydown',async e=>{
  const want=b.vk;ST=await api().set_settings(ST);
  if(want&&!ST[k].vk)toast('Add a modifier (Win, Ctrl, Alt or Shift) for that key.',true);renderKeys()},true);
 async function chooseFolder(){ST=await api().pick_folder();renderKeys();galleryRefresh()}
+var GALL={q:'',sort:'new',sel:false,picked:new Set(),anchor:null},TH=new Map(),GQT=null,SDT=null;
 async function galleryRefresh(){
- G=await api().gallery_list();setBadge(G.unseen);
- $('gsub').textContent=`${G.items.length} screenshot${G.items.length==1?'':'s'}`;renderGrid()}
+ const d=await api().gallery_list();G=d;G.all=d.items;setBadge(G.unseen);applyView()}
+function applyView(){
+ const q=GALL.q.trim().toLowerCase(),nm=(a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true});
+ const cmp={new:(a,b)=>b.mtime-a.mtime,old:(a,b)=>a.mtime-b.mtime,az:nm,za:(a,b)=>nm(b,a),big:(a,b)=>(b.size||0)-(a.size||0)}[GALL.sort]||((a,b)=>b.mtime-a.mtime);
+ G.items=G.all.filter(x=>!q||x.name.toLowerCase().includes(q)).sort(cmp);
+ const vis=new Set(G.items.map(x=>x.path));GALL.picked=new Set([...GALL.picked].filter(p=>vis.has(p)));
+ const n=G.all.length,m=G.items.length;
+ $('gsub').textContent=n==m?`${n} screenshot${n==1?'':'s'}`:`${m} of ${n} screenshots`;
+ renderGrid();if(GALL.sel)paintSel()}
 function renderGrid(){
  const g=$('grid');
- if(!G.items.length){g.innerHTML=`<div class="empty" style="grid-column:1/-1">No screenshots yet. Press ${esc(combo(ST.region))} to take one.</div>`;return}
- g.innerHTML=G.items.map((x,i)=>`<button class="tile ${x.new?'new':''}" data-i="${i}" onclick="openLB(${i})"><img alt=""><span>${esc(x.name.replace(/\.[^.]+$/,''))}</span></button>`).join('');
+ if(!G.items.length){
+  g.innerHTML=G.all&&G.all.length?`<div class="empty" style="grid-column:1/-1">No screenshots match “${esc(GALL.q)}”.</div>`:`<div class="empty" style="grid-column:1/-1">No screenshots yet. Press ${esc(combo(ST.region))} to take one.</div>`;return}
+ g.innerHTML=G.items.map((x,i)=>`<button class="tile ${x.new?'new':''} ${GALL.picked.has(x.path)?'pk':''}" data-i="${i}" onclick="tileClick(event,${i})"><img alt=""><i class="ck"></i><span>${esc(x.name.replace(/\.[^.]+$/,''))}</span></button>`).join('');
  if(IO)IO.disconnect();
  IO=new IntersectionObserver(es=>es.forEach(async e=>{
   if(!e.isIntersecting)return;IO.unobserve(e.target);
-  try{e.target.querySelector('img').src=await api().thumb(G.items[+e.target.dataset.i].path);e.target.classList.add('ld')}catch(_){}
+  const x=G.items[+e.target.dataset.i];if(!x)return;const key=x.path+'|'+x.mtime;
+  try{let src=TH.get(key);if(!src){src=await api().thumb(x.path);TH.set(key,src)}
+   e.target.querySelector('img').src=src;e.target.classList.add('ld')}catch(_){}
  }),{root:$('gmain'),rootMargin:'400px'});
  g.querySelectorAll('.tile').forEach(t=>IO.observe(t))}
+function tileClick(e,i){
+ const x=G.items[i];
+ if(GALL.sel||e.ctrlKey||e.metaKey||e.shiftKey){
+  e.preventDefault();if(!GALL.sel)setSel(true);
+  if(e.shiftKey&&GALL.anchor!=null){const a=Math.min(GALL.anchor,i),b=Math.max(GALL.anchor,i);for(let j=a;j<=b;j++)GALL.picked.add(G.items[j].path)}
+  else{GALL.picked.has(x.path)?GALL.picked.delete(x.path):GALL.picked.add(x.path);GALL.anchor=i}
+  paintSel();return}
+ openLB(i)}
+function resetDel(){clearTimeout(SDT);SDT=null;const b=$('seldel');if(b)b.textContent='Delete'}
+function paintSel(){
+ document.querySelectorAll('#grid .tile').forEach(t=>{const x=G.items[+t.dataset.i];t.classList.toggle('pk',!!x&&GALL.picked.has(x.path))});
+ const n=GALL.picked.size;$('selcount').textContent=n?`${n} selected`:'Select screenshots';$('seldel').disabled=!n;resetDel()}
+function setSel(on){GALL.sel=on;if(!on){GALL.picked.clear();GALL.anchor=null}$('shots').classList.toggle('selmode',on);$('grid').classList.toggle('selmode',on);paintSel()}
+function selAll(){const all=G.items.length&&G.items.every(x=>GALL.picked.has(x.path));G.items.forEach(x=>all?GALL.picked.delete(x.path):GALL.picked.add(x.path));paintSel()}
+async function delSel(){
+ const n=GALL.picked.size;if(!n)return;const b=$('seldel');
+ if(!SDT){b.textContent=`Click again to delete ${n}`;SDT=setTimeout(()=>{SDT=null;b.textContent='Delete'},3000);return}
+ resetDel();const paths=[...GALL.picked];
+ setBadge(await api().delete_shots(paths));
+ const gone=new Set(paths);G.all=G.all.filter(x=>!gone.has(x.path));setSel(false);applyView();toast(`Moved ${paths.length} to Recycle Bin`)}
+function setQuery(v){GALL.q=v;$('gsearch').classList.toggle('has',!!v);clearTimeout(GQT);GQT=setTimeout(applyView,90)}
+function clearQuery(){$('gq').value='';setQuery('');$('gq').focus()}
+function setSort(v){GALL.sort=v;ST.gallery_sort=v;ddRender();applyView();api().set_settings(ST).then(r=>{ST=r})}
+document.addEventListener('keydown',e=>{
+ if(!GALL.sel||LB>=0||ED||CAPK||$('upd').classList.contains('show'))return;
+ if(e.key=='Escape')setSel(false);
+ else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()=='a'&&!(e.target&&e.target.tagName=='INPUT')){e.preventDefault();selAll()}});
 async function openLB(i,dir){
  if(LBA)setActual(false);LB=i;const x=G.items[i];
  if(x.new){x.new=false;const t=document.querySelector(`.tile[data-i="${i}"]`);if(t)t.classList.remove('new');api().mark_seen(x.path).then(setBadge)}$('lbn').textContent=x.name;$('lb').classList.add('show');syncModal();lbNavUi();zoomReset(true);
@@ -2136,18 +2313,18 @@ async function lbDel(){
  const b=$('lbdel');
  if(!DELT){b.textContent='Click again to delete';DELT=setTimeout(()=>{DELT=null;b.textContent='Delete'},3000);return}
  clearTimeout(DELT);DELT=null;b.textContent='Delete';
- setBadge(await api().delete_shot(G.items[LB].path));G.items.splice(LB,1);
- $('gsub').textContent=`${G.items.length} screenshot${G.items.length==1?'':'s'}`;renderGrid();
- if(!G.items.length)closeLB();else openLB(Math.min(LB,G.items.length-1));toast('Moved to Recycle Bin')}
+ const rm=G.items[LB];setBadge(await api().delete_shot(rm.path));G.all=G.all.filter(x=>x!==rm);
+ const keep=LB;applyView();
+ if(!G.items.length)closeLB();else openLB(Math.min(keep,G.items.length-1));toast('Moved to Recycle Bin')}
 async function openShot(path){
  if(ED)edCancel(true);
- page(1);await galleryRefresh();
+ page(1);GALL.q='';$('gq').value='';$('gsearch').classList.remove('has');await galleryRefresh();
  const i=G.items.findIndex(x=>x.path.toLowerCase()==path.toLowerCase());if(i>=0)openLB(i)}
 document.addEventListener('keydown',e=>{
  if(LB<0||CAPK||ED)return;if(e.key=='Escape'){if(LBF)lbFull();else closeLB()}if(e.key=='f'||e.key=='F')lbFull();if(e.key=='ArrowLeft')lbGo(-1);if(e.key=='ArrowRight')lbGo(1)});
 document.addEventListener('keydown',e=>{if(!open())return;if(e.key=='Enter')keep();if(e.key=='Escape')undo()});
 $('q').oninput=renderList;
-window.addEventListener('pywebviewready',async()=>{ST=await api().get_settings();applyLite();renderKeys();refresh(true);api().unseen_count().then(setBadge);
+window.addEventListener('pywebviewready',async()=>{ST=await api().get_settings();applyLite();applyTheme();GALL.sort=ST.gallery_sort||'new';ddRender();renderKeys();refresh(true);api().unseen_count().then(setBadge);
  api().app_info().then(i=>{FORCEUPD=!!i.force;$('s_ver').textContent='v'+i.version;renderSet();
   if(ST.auto_update!==false||FORCEUPD){setTimeout(()=>checkUpd(false),3000);setInterval(()=>{if(!$('upd').classList.contains('show'))checkUpd(false)},6*3600*1000)}})});
 
@@ -2156,11 +2333,19 @@ async function maxi(){setMax(await api().toggle_maximize())}
 function setMax(m){const b=$('wmax');b.title=m?'Restore':'Maximize';b.setAttribute('aria-label',b.title);
  $('wmaxi').innerHTML=m?'<rect x="1.5" y="3.5" width="7" height="7" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M3.8 3.5V2.7c0-.7.5-1.2 1.2-1.2h4.3c.7 0 1.2.5 1.2 1.2V7c0 .7-.5 1.2-1.2 1.2h-.8" fill="none" stroke="currentColor" stroke-width="1.4"/>':'<rect x="1.5" y="1.5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/>'}
 
-/* ---- image editor: brush (any color), crop, eyedropper ---- */
+/* ---- image editor: brush, highlighter, arrow, box, text, pixelate, blur, crop, eyedropper ---- */
 var ED=null,EDOW=null;
-function edUi(){if(!ED)return;$('edundo').disabled=!ED.hist.length;$('edapply').disabled=!ED.sel;
- ['brush','crop','pick'].forEach(t=>$('t_'+t).classList.toggle('on',ED.tool==t));
- $('edcv').style.cursor=ED.tool=='crop'?'crosshair':ED.tool=='pick'?'copy':'none';if(ED.tool!='brush')$('edcur').style.display='none'}
+const ED_TOOLS=['brush','hl','arrow','rect','text','pixel','blur','crop','pick'];
+function edUi(){
+ if(!ED)return;
+ $('edundo').disabled=!ED.hist.length;$('edapply').disabled=!(ED.sel&&ED.tool=='crop');
+ ED_TOOLS.forEach(t=>$('t_'+t).classList.toggle('on',ED.tool==t));
+ $('edfill').style.display=ED.tool=='rect'?'':'none';$('edfill').classList.toggle('on',!!ED.fill);
+ const circ=ED.tool=='brush'||ED.tool=='hl';
+ $('edcv').style.cursor=circ?'none':ED.tool=='pick'?'copy':ED.tool=='text'?'text':'crosshair';
+ if(!circ)$('edcur').style.display='none'}
+function edSync(){const o=$('edov');o.width=ED.cv.width;o.height=ED.cv.height;o.style.opacity=1}
+function edOvClear(){const o=$('edov');o.getContext('2d').clearRect(0,0,o.width,o.height);o.style.opacity=1}
 function lbEdit(){
  if(LB<0)return;if(LBF)lbFull();setActual(false);
  const x=G.items[LB],src=$('lbi').src;if(!src)return;
@@ -2168,11 +2353,13 @@ function lbEdit(){
  im.onload=()=>{
   const cv=$('edcv');cv.width=im.naturalWidth;cv.height=im.naturalHeight;
   const ctx=cv.getContext('2d');ctx.drawImage(im,0,0);
-  ED={path:x.path,cv,ctx,hist:[],tool:'brush',color:$('edcol').value,size:+$('edsize').value,sel:null,drag:null,stroke:false,last:null};
-  $('edsel').classList.remove('show');clearTimeout(EDOW);EDOW=null;$('edow').textContent='Overwrite';
+  ED={path:x.path,cv,ctx,hist:[],tool:'brush',color:$('edcol').value,size:+$('edsize').value,sel:null,drag:null,stroke:false,last:null,fill:false,hl:null,cur:null,txt:0};
+  edSync();$('edtxt').style.display='none';
+  $('edsel').classList.remove('show','soft');clearTimeout(EDOW);EDOW=null;$('edow').textContent='Overwrite';
   $('ed').classList.add('show');$('edhex').value=ED.color;edSize();edUi()};
  im.src=src}
-function edTool(t){if(!ED)return;ED.tool=t;if(t!='crop')edClearSel();edUi()}
+function edTool(t){if(!ED)return;edTextCommit();edOvClear();edClearSel();ED.hl=null;ED.tool=t;edUi()}
+function edToggleFill(){if(ED){ED.fill=!ED.fill;edUi()}}
 function edColor(c,typing){if(!ED)return;ED.color=c;$('edcol').value=c;if(!typing){$('edhex').value=c;$('edhex').classList.remove('bad')}if(ED.tool=='pick')ED.tool='brush';edUi();edPrev()}
 function parseCol(t){t=t.trim().toLowerCase();
  let m=t.match(/^#?([0-9a-f]{3}|[0-9a-f]{6})$/);
@@ -2183,35 +2370,100 @@ function parseCol(t){t=t.trim().toLowerCase();
 function edHex(t,typing){const c=parseCol(t),el=$('edhex');
  if(c){edColor(c,typing)}else{el.classList.toggle('bad',!typing&&t.trim()!=='');if(!typing&&t.trim()!==''){toast('Use a hex like #ff8800 or rgb like 255, 136, 0',true);el.value=ED?ED.color:'#000000';el.classList.remove('bad');el.classList.remove('shake');void el.offsetWidth;el.classList.add('shake')}}}
 function edPrev(){const i=document.querySelector('#edprev i');if(!i||!ED)return;const d=Math.round(4+(ED.size/150)*32);i.style.width=i.style.height=d+'px';i.style.background=ED.color}
-function edSize(){const r=$('edsize'),v=+r.value;$('edsizen').textContent=v;r.style.setProperty('--p',((v-2)/148*100)+'%');if(ED){ED.size=v;edPrev();const c=$('edcur');c.style.width=c.style.height=v+'px'}}
+function edSize(){const r=$('edsize'),v=+r.value;$('edsizen').textContent=v;r.style.setProperty('--p',((v-2)/148*100)+'%');if(ED){ED.size=v;edPrev();const c=$('edcur');c.style.width=c.style.height=(ED.tool=='hl'?v*.9:v)+'px'}}
 function edPush(){ED.hist.push(ED.ctx.getImageData(0,0,ED.cv.width,ED.cv.height));if(ED.hist.length>15)ED.hist.shift();edUi()}
-function edUndo(){if(!ED||!ED.hist.length)return;const d=ED.hist.pop();ED.cv.width=d.width;ED.cv.height=d.height;ED.ctx.putImageData(d,0,0);edClearSel();edUi()}
+function edUndo(){if(!ED||!ED.hist.length)return;edTextCommit();const d=ED.hist.pop();ED.cv.width=d.width;ED.cv.height=d.height;ED.ctx.putImageData(d,0,0);edSync();edClearSel();edUi()}
 function edPos(e){const r=ED.cv.getBoundingClientRect(),k=ED.cv.width/r.width;
  return{x:Math.max(0,Math.min(ED.cv.width,(e.clientX-r.left)*k)),y:Math.max(0,Math.min(ED.cv.height,(e.clientY-r.top)*k)),k}}
-function edClearSel(){if(!ED)return;ED.sel=null;ED.drag=null;$('edsel').classList.remove('show');$('edapply').disabled=true}
+function edClearSel(){if(!ED)return;ED.sel=null;ED.drag=null;$('edsel').classList.remove('show','soft');$('edapply').disabled=true}
 function edShowSel(){const s=ED.sel,el=$('edsel');if(!s){el.classList.remove('show');return}
  el.style.left=s.x/ED.cv.width*100+'%';el.style.top=s.y/ED.cv.height*100+'%';el.style.width=s.w/ED.cv.width*100+'%';el.style.height=s.h/ED.cv.height*100+'%';el.classList.add('show')}
 function edApplyCrop(){
- const s=ED&&ED.sel;if(!s||s.w<3||s.h<3)return;
+ const s=ED&&ED.sel;if(!s||s.w<3||s.h<3||ED.tool!='crop')return;
  edPush();const x=Math.round(s.x),y=Math.round(s.y),w=Math.max(1,Math.round(s.w)),h=Math.max(1,Math.round(s.h));
- const d=ED.ctx.getImageData(x,y,w,h);ED.cv.width=w;ED.cv.height=h;ED.ctx.putImageData(d,0,0);edClearSel();edUi();toast('Cropped')}
+ const d=ED.ctx.getImageData(x,y,w,h);ED.cv.width=w;ED.cv.height=h;ED.ctx.putImageData(d,0,0);edSync();edClearSel();edUi();toast('Cropped')}
 function edStroke(p){const c=ED.ctx;c.strokeStyle=c.fillStyle=ED.color;c.lineCap=c.lineJoin='round';c.lineWidth=ED.size*p.k;
  c.beginPath();c.moveTo(ED.last.x,ED.last.y);c.lineTo(p.x,p.y);c.stroke();ED.last=p}
-function edCursor(e){const c=$('edcur');if(!ED||ED.tool!='brush'){c.style.display='none';return}
+const edLW=k=>Math.max(2,ED.size/5)*k;
+function drawArrow(c,a,b,col,w){
+ const ang=Math.atan2(b.y-a.y,b.x-a.x),hl=Math.max(14,w*4.2),ha=Math.PI/7;
+ c.strokeStyle=c.fillStyle=col;c.lineWidth=w;c.lineCap=c.lineJoin='round';
+ c.beginPath();c.moveTo(a.x,a.y);c.lineTo(b.x-Math.cos(ang)*hl*.6,b.y-Math.sin(ang)*hl*.6);c.stroke();
+ c.beginPath();c.moveTo(b.x,b.y);c.lineTo(b.x-hl*Math.cos(ang-ha),b.y-hl*Math.sin(ang-ha));c.lineTo(b.x-hl*Math.cos(ang+ha),b.y-hl*Math.sin(ang+ha));c.closePath();c.fill()}
+function drawRect(c,a,b,col,w,fill){
+ const x=Math.min(a.x,b.x),y=Math.min(a.y,b.y),W=Math.abs(b.x-a.x),H=Math.abs(b.y-a.y);
+ c.strokeStyle=c.fillStyle=col;c.lineWidth=w;c.lineJoin='round';if(fill)c.fillRect(x,y,W,H);else c.strokeRect(x,y,W,H)}
+function edShape(c,t,a,b,k){if(t=='arrow')drawArrow(c,a,b,ED.color,edLW(k));else drawRect(c,a,b,ED.color,edLW(k),ED.fill)}
+function edHlDraw(k){const o=$('edov'),c=o.getContext('2d'),pts=ED.hl;c.clearRect(0,0,o.width,o.height);
+ c.strokeStyle=ED.color;c.lineWidth=ED.size*k*.9;c.lineCap=c.lineJoin='round';c.beginPath();
+ pts.forEach((p,i)=>i?c.lineTo(p.x,p.y):c.moveTo(p.x,p.y));if(pts.length==1)c.lineTo(pts[0].x+.01,pts[0].y);c.stroke()}
+function edPixelate(s,B){
+ const x=Math.round(s.x),y=Math.round(s.y),w=Math.round(s.w),h=Math.round(s.h);if(w<2||h<2)return;
+ const d=ED.ctx.getImageData(x,y,w,h),a=d.data;
+ for(let by=0;by<h;by+=B)for(let bx=0;bx<w;bx+=B){
+  const bw=Math.min(B,w-bx),bh=Math.min(B,h-by);let r=0,g=0,b=0,n=0;
+  for(let j=0;j<bh;j++)for(let i=0;i<bw;i++){const q=((by+j)*w+bx+i)*4;r+=a[q];g+=a[q+1];b+=a[q+2];n++}
+  r=r/n|0;g=g/n|0;b=b/n|0;
+  for(let j=0;j<bh;j++)for(let i=0;i<bw;i++){const q=((by+j)*w+bx+i)*4;a[q]=r;a[q+1]=g;a[q+2]=b}}
+ ED.ctx.putImageData(d,x,y)}
+function edBlur(s,rad){
+ const x=Math.round(s.x),y=Math.round(s.y),w=Math.round(s.w),h=Math.round(s.h);if(w<2||h<2)return;
+ const t=document.createElement('canvas');t.width=ED.cv.width;t.height=ED.cv.height;t.getContext('2d').drawImage(ED.cv,0,0);
+ const c=ED.ctx;c.save();c.beginPath();c.rect(x,y,w,h);c.clip();c.filter=`blur(${rad}px)`;c.drawImage(t,0,0);c.restore();
+ const d=c.getImageData(x,y,w,h);for(let i=3;i<d.data.length;i+=4)d.data[i]=255;c.putImageData(d,x,y)}
+function edTextAt(e,p){
+ edTextCommit();
+ const box=$('edbox').getBoundingClientRect(),inp=$('edtxt'),px=Math.max(12,Math.round(ED.size*.9));
+ inp.style.cssText=`display:block;left:${e.clientX-box.left-3}px;top:${e.clientY-box.top-px*.6}px;font-size:${px}px;color:${ED.color}`;
+ inp.value='';inp.dataset.ix=p.x;inp.dataset.iy=p.y;inp.dataset.k=p.k;inp.dataset.px=px;ED.txt=performance.now();
+ requestAnimationFrame(()=>inp.focus())}
+function edTextCommit(){
+ const inp=$('edtxt');if(inp.style.display!=='block')return;
+ const t=inp.value;inp.style.display='none';
+ if(!t.trim()||!ED)return;
+ edPush();const k=+inp.dataset.k,c=ED.ctx;
+ c.font=`600 ${(+inp.dataset.px)*k}px "Segoe UI",system-ui,sans-serif`;c.fillStyle=ED.color;c.textBaseline='middle';
+ c.fillText(t,+inp.dataset.ix,+inp.dataset.iy)}
+function edTxtKey(e){e.stopPropagation();
+ if(e.key=='Enter'){e.preventDefault();edTextCommit()}
+ else if(e.key=='Escape'){e.preventDefault();const i=$('edtxt');i.value='';i.style.display='none'}}
+function edTxtBlur(){if(ED&&performance.now()-ED.txt>250)edTextCommit()}
+function edCursor(e){const c=$('edcur');if(!ED||(ED.tool!='brush'&&ED.tool!='hl')){c.style.display='none';return}
  const r=ED.cv.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom){c.style.display='none';return}
- c.style.display='block';c.style.width=c.style.height=ED.size+'px';c.style.background=ED.color+'59';c.style.left=e.clientX+'px';c.style.top=e.clientY+'px'}
+ const d=ED.tool=='hl'?ED.size*.9:ED.size;
+ c.style.display='block';c.style.width=c.style.height=d+'px';c.style.background=ED.color+'59';c.style.left=e.clientX+'px';c.style.top=e.clientY+'px'}
 (function(){
  const cv=$('edcv');
  cv.addEventListener('pointerdown',e=>{
-  if(!ED||e.button!==0)return;cv.setPointerCapture(e.pointerId);const p=edPos(e);
-  if(ED.tool=='brush'){edPush();ED.stroke=true;ED.last=p;edStroke(p)}
-  else if(ED.tool=='crop'){ED.drag={x:p.x,y:p.y};ED.sel={x:p.x,y:p.y,w:0,h:0};edShowSel()}
-  else if(ED.tool=='pick'){const d=ED.ctx.getImageData(Math.min(cv.width-1,p.x|0),Math.min(cv.height-1,p.y|0),1,1).data;
+  if(!ED||e.button!==0)return;const p=edPos(e),t=ED.tool;
+  if(t=='text'){e.preventDefault();edTextAt(e,p);return}
+  edTextCommit();cv.setPointerCapture(e.pointerId);
+  if(t=='brush'){edPush();ED.stroke=true;ED.last=p;edStroke(p)}
+  else if(t=='hl'){edPush();ED.hl=[p];$('edov').style.opacity=.4;edHlDraw(p.k)}
+  else if(t=='arrow'||t=='rect'){ED.drag={x:p.x,y:p.y};ED.cur=p}
+  else if(t=='crop'||t=='pixel'||t=='blur'){ED.drag={x:p.x,y:p.y};ED.sel={x:p.x,y:p.y,w:0,h:0};$('edsel').classList.toggle('soft',t!='crop');edShowSel()}
+  else if(t=='pick'){const d=ED.ctx.getImageData(Math.min(cv.width-1,p.x|0),Math.min(cv.height-1,p.y|0),1,1).data;
    const hx='#'+[d[0],d[1],d[2]].map(v=>v.toString(16).padStart(2,'0')).join('');edColor(hx);ED.tool='brush';edUi();toast('Picked '+hx)}});
  cv.addEventListener('pointermove',e=>{if(!ED)return;edCursor(e);const p=edPos(e);
   if(ED.stroke)edStroke(p);
-  else if(ED.drag){const a=ED.drag;ED.sel={x:Math.min(a.x,p.x),y:Math.min(a.y,p.y),w:Math.abs(p.x-a.x),h:Math.abs(p.y-a.y)};edShowSel()}});
- const up=()=>{if(!ED)return;ED.stroke=false;if(ED.drag){ED.drag=null;if(ED.sel&&(ED.sel.w<3||ED.sel.h<3))edClearSel();edUi()}};
+  else if(ED.hl){ED.hl.push(p);edHlDraw(p.k)}
+  else if(ED.drag){const a=ED.drag,t=ED.tool;
+   if(t=='arrow'||t=='rect'){ED.cur=p;edOvClear();edShape($('edov').getContext('2d'),t,a,p,p.k)}
+   else{ED.sel={x:Math.min(a.x,p.x),y:Math.min(a.y,p.y),w:Math.abs(p.x-a.x),h:Math.abs(p.y-a.y)};edShowSel()}}});
+ const up=e=>{
+  if(!ED)return;ED.stroke=false;
+  if(ED.hl){ED.ctx.save();ED.ctx.globalAlpha=.4;ED.ctx.drawImage($('edov'),0,0);ED.ctx.restore();edOvClear();ED.hl=null;edUi();return}
+  if(ED.drag){
+   const t=ED.tool,a=ED.drag;ED.drag=null;
+   if(t=='arrow'||t=='rect'){const b=ED.cur||a;edOvClear();
+    if(Math.hypot(b.x-a.x,b.y-a.y)>3*(b.k||1)){edPush();edShape(ED.ctx,t,a,b,b.k)}
+    ED.cur=null;edUi();return}
+   const s=ED.sel;
+   if(!s||s.w<3||s.h<3){edClearSel();edUi();return}
+   if(t=='pixel'||t=='blur'){const k=edPos(e).k;edPush();
+    if(t=='pixel')edPixelate(s,Math.max(4,Math.round(ED.size*k/2.2)));else edBlur(s,Math.max(3,ED.size*k/3));
+    edClearSel()}
+   edUi()}};
  cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
  cv.addEventListener('pointerleave',()=>{$('edcur').style.display='none'});
 })();
@@ -2219,9 +2471,10 @@ let EDX=null;
 function edCancel(force){
  if(!ED)return;
  if(ED.hist.length&&!force&&!EDX){toast('You have unsaved edits. Cancel again to discard them.');EDX=setTimeout(()=>EDX=null,3000);return}
- clearTimeout(EDX);EDX=null;ED=null;$('ed').classList.remove('show');$('edcur').style.display='none'}
+ clearTimeout(EDX);EDX=null;$('edtxt').style.display='none';ED=null;$('ed').classList.remove('show');$('edcur').style.display='none'}
 async function edSave(over){
  if(!ED)return;
+ edTextCommit();
  if(over&&!EDOW){const b=$('edow');b.textContent='Click again to overwrite';EDOW=setTimeout(()=>{EDOW=null;b.textContent='Overwrite'},3000);return}
  clearTimeout(EDOW);EDOW=null;$('edow').textContent='Overwrite';
  const path=ED.path;
@@ -2233,12 +2486,15 @@ async function edSave(over){
  }catch(err){toast('Could not save: '+err,true)}}
 document.addEventListener('keydown',e=>{
  if(!ED)return;
- if(e.target&&e.target.id=='edhex'&&e.key!='Escape')return;
+ const id=e.target&&e.target.id;
+ if(id=='edtxt')return;
+ if(id=='edhex'&&e.key!='Escape')return;
  if(e.key=='Escape'){e.preventDefault();e.stopPropagation();edCancel()}
- else if(e.key=='Enter'&&ED.sel){e.preventDefault();edApplyCrop()}
+ else if(e.key=='Enter'&&ED.sel&&ED.tool=='crop'){e.preventDefault();edApplyCrop()}
  else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()=='z'){e.preventDefault();edUndo()}
  else if(e.key=='['){const r=$('edsize');r.value=Math.max(2,+r.value-4);edSize()}
  else if(e.key==']'){const r=$('edsize');r.value=Math.min(150,+r.value+4);edSize()}},true);
+
 
 /* ---- low-end mode ---- */
 var LITE=false;
@@ -2360,6 +2616,62 @@ async function checkUpd(manual){
   document.addEventListener(ev,e=>{if(ev=='focusin'||ev=='focusout'||ok(e.target))sched()},true));
  document.addEventListener('selectionchange',sched);window.addEventListener('resize',sched);
 })();
+
+/* ---- theme: Auto follows Windows, Light/Dark override it ---- */
+function applyTheme(){
+ const t=(ST&&ST.theme)||'auto',r=document.documentElement;
+ if(t==='auto')r.removeAttribute('data-theme');else r.setAttribute('data-theme',t);
+ const i={auto:0,light:1,dark:2}[t]??0,sg=$('themeSeg');sg.style.setProperty('--i',i);sg.querySelectorAll('.sg').forEach((b,j)=>b.classList.toggle('on',j==i))}
+function setTheme(v){
+ if(!LITE){const r=document.documentElement;r.classList.add('tflip');setTimeout(()=>r.classList.remove('tflip'),450)}
+ ST.theme=v;applyTheme();api().set_settings(ST).then(r=>{ST=r})}
+/* ---- saved image format ---- */
+function renderFmt(){
+ const f=ST.img_format||'png',q=ST.img_quality??92,i={png:0,jpg:1,webp:2}[f]??0,sg=$('fmtSeg');
+ sg.style.setProperty('--i',i);sg.querySelectorAll('.sg').forEach((b,j)=>b.classList.toggle('on',j==i));
+ $('s_q').value=q;$('s_q').style.setProperty('--p',((q-50)/50*100)+'%');$('o_q').textContent=q;
+ $('qrow').style.display=f=='png'?'none':'';
+ $('fmtnote').textContent=f=='png'?'PNG keeps every pixel exactly. Files are larger.':f=='jpg'?'JPG makes much smaller files. Quality under about 85 can blur small text.':'WebP also makes small files. A few older apps can\'t open it.'}
+function setFmt(f){ST.img_format=f;renderFmt();api().set_settings(ST).then(r=>{ST=r})}
+function qLive(el){const q=+el.value;el.style.setProperty('--p',((q-50)/50*100)+'%');$('o_q').textContent=q}
+function setQ(v){ST.img_quality=+v;api().set_settings(ST).then(r=>{ST=r})}
+/* ---- changelog ---- */
+var CLOG=null;
+async function toggleClog(){
+ const p=$('clog'),b=$('clogbtn');
+ if(p.classList.contains('open')){p.classList.remove('open');b.textContent='Show changelog';return}
+ p.classList.add('open');b.textContent='Hide changelog';
+ if(CLOG)return;
+ p.innerHTML='<div class="cl"><small>Loading…</small></div>';
+ let r;try{r=await api().get_changelog()}catch(e){r={ok:false,msg:"Couldn't load the changelog."}}
+ if(!r.ok){p.innerHTML=`<div class="cl"><small>${esc(r.msg)}</small></div>`;return}
+ CLOG=r;
+ const fd=d=>{const t=new Date(d+'T00:00:00');return isNaN(t)?d:t.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'})};
+ p.innerHTML=r.items.length?r.items.map(x=>`<div class="cl"><div class="clh"><b>${esc(x.tag)}</b>${x.current?'<span class="clcur">Installed</span>':''}<small>${esc(fd(x.date))}</small></div><pre>${esc(x.body||'No notes for this release.')}</pre></div>`).join(''):'<div class="cl"><small>No releases yet.</small></div>'}
+
+/* ---- sort dropdown ---- */
+var DDT=null;
+const SORT_LABEL={new:'Newest first',old:'Oldest first',az:'Name A to Z',za:'Name Z to A',big:'Largest first'};
+function ddRender(){
+ $('gsortl').textContent=SORT_LABEL[GALL.sort]||SORT_LABEL.new;
+ document.querySelectorAll('#gsortm .ddi').forEach(b=>{const on=b.dataset.v==GALL.sort;b.classList.toggle('on',on);b.setAttribute('aria-selected',on)})}
+function ddOpen(){return $('gdd').classList.contains('open')}
+function ddToggle(force){
+ const dd=$('gdd'),want=force===undefined?!ddOpen():force;
+ if(want===ddOpen()&&!dd.classList.contains('out'))return;
+ clearTimeout(DDT);
+ if(want){dd.classList.remove('out');dd.classList.add('open');$('gsortb').setAttribute('aria-expanded','true');
+  requestAnimationFrame(()=>{const t=document.querySelector('#gsortm .ddi.on')||document.querySelector('#gsortm .ddi');if(t)t.focus({preventScroll:true})})}
+ else{$('gsortb').setAttribute('aria-expanded','false');
+  if(LITE)dd.classList.remove('open','out');else{dd.classList.add('out');DDT=setTimeout(()=>dd.classList.remove('open','out'),140)}}}
+function ddPick(v){setSort(v);ddToggle(false);$('gsortb').focus({preventScroll:true})}
+function ddKey(e){
+ const its=[...document.querySelectorAll('#gsortm .ddi')],i=its.indexOf(document.activeElement);
+ if(e.key=='ArrowDown'){e.preventDefault();its[(i+1)%its.length].focus()}
+ else if(e.key=='ArrowUp'){e.preventDefault();its[(i-1+its.length)%its.length].focus()}
+ else if(e.key=='Escape'){e.preventDefault();e.stopPropagation();ddToggle(false);$('gsortb').focus()}
+ else if(e.key=='Tab')ddToggle(false)}
+document.addEventListener('mousedown',e=>{if(ddOpen()&&!$('gdd').contains(e.target))ddToggle(false)});
 </script></body></html>
 """
 
@@ -2415,7 +2727,7 @@ def build_tray():
         pystray.MenuItem("Screenshot (full screen)", lambda icon, item: threading.Thread(target=take, args=("full",), daemon=True).start()),
         pystray.MenuItem("Presets", pystray.Menu(presets_menu)),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("Exit", lambda icon, item: quit_app()),
+        pystray.MenuItem("Quit Helpy", lambda icon, item: quit_app()),
     )
     return pystray.Icon("Helpy", img, "Helpy", menu)
 
@@ -2449,10 +2761,6 @@ def main():
     WINDOW = webview.create_window("Helpy", html=HTML, js_api=Api(), width=1120, height=760,
                                    frameless=True, easy_drag=False, resizable=False,
                                    background_color="#1c1c1e", hidden=a.minimized)
-    try:  # minimizing from the taskbar also sends it to the tray
-        WINDOW.events.minimized += lambda: WINDOW.hide()
-    except Exception:
-        pass
     TRAY = build_tray()
     TRAY.run_detached()
     update_badge(False)

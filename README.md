@@ -26,18 +26,24 @@ Built with Python, a native Windows API backend and a custom HTML/CSS/JS interfa
 - Every shot is saved to your folder and copied to the clipboard.
 - Optional popup notification that fades and slides in and out, plus a camera sound (bring your own sound file, set the volume, or silence it in games).
 - **Gallery** with thumbnails, a "new" badge for shots you haven't opened yet, copy, show in folder and delete.
+- **Search, sort and multi-select.** Find shots by name, sort by newest, oldest, name or size, and select several at once (`Ctrl+click`, `Shift+click` for a range) to delete them together.
+- **Save format and quality.** Save as PNG, JPG or WebP, with a quality slider for JPG and WebP. It applies to new screenshots and to edited copies.
 
 ### Viewer
 - Full view, previous/next navigation with a slide animation, and click-outside-to-close.
 - **Ctrl + scroll** to zoom toward your cursor, drag to move around, scroll back out to reset.
 
 ### Editor
-- **Brush** with a size slider and any color: color picker, hex or RGB input, quick swatches, or an eyedropper that picks a color straight from the image. Handy for covering things up.
+- **Brush** and **Highlighter** with a size slider and any color: color picker, hex or RGB input, quick swatches, or an eyedropper that picks a color straight from the image.
+- **Arrow**, **Box** (outline or filled) and **Text** for pointing things out.
+- **Pixelate** and **Blur** to properly hide sensitive info.
 - **Crop** by dragging a box.
 - Undo (`Ctrl+Z`), then **Save copy** or **Overwrite**.
 
 ### App
-- Maximize / restore, minimize to tray, optional launch at Windows startup.
+- **Light and dark theme.** Follows your Windows setting automatically, or pick Light or Dark in Settings.
+- **Changelog** in Settings shows what changed in each version.
+- Maximize / restore, minimize to the taskbar, close to the tray, optional launch at Windows startup.
 - Animated page and tab transitions, hover feedback and a smooth gliding text caret.
 - **Low-end mode** (Settings → Performance) turns off animations, smooth scrolling and blur effects for older PCs.
 
@@ -84,6 +90,7 @@ Helpy checks GitHub for a newer release when it starts and again every few hours
 
 ## Notes
 
+- The X button doesn't quit Helpy, it hides it to the tray so your shortcuts keep working. To fully close it, right-click the tray icon and choose **Quit Helpy**. The minimize button puts it on the taskbar as usual.
 - With the default `Win+Shift+S` binding, Helpy takes the shortcut over while it runs, so the Snipping Tool won't open. Quit Helpy and Windows gets it back, or bind a different key in Settings.
 - Digital vibrance is NVIDIA-only. Everything else works on any GPU.
 - A custom mode only works if your driver and monitor accept it.

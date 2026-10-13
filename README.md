@@ -86,7 +86,7 @@ Delete that folder to reset Helpy completely. Updating or rebuilding the exe nev
 
 ## Updates
 
-Helpy checks GitHub for a newer release when it starts and again every few hours while it's running. When one is available you're asked to **update now** or exit; Helpy downloads the new `Helpy.exe`, replaces itself and restarts. You can also check by hand in Settings → Updates.
+Helpy checks GitHub for a newer release when it starts and every few hours while it's running. Most updates are optional: you can update right away or choose **Later**. Occasionally a release is marked **important** (for example an urgent fix), and then you need to update to keep using Helpy. Either way, Helpy downloads the new `Helpy.exe`, replaces itself and restarts. You can also check by hand in Settings → Updates.
 
 ## Notes
 

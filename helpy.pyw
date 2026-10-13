@@ -1,3 +1,11 @@
+"""
+Helpy - resolution + refresh rate switcher for Windows (pywebview UI).
+
+  pip install pywebview pystray pillow   (tkinter ships with Python)
+  python helpy.pyw
+  python helpy.pyw --apply "Gaming"     # apply a preset without opening the UI
+"""
+
 import argparse, ctypes, json, os, sys
 from ctypes import wintypes
 
@@ -324,7 +332,6 @@ DEF_SETTINGS = {
     "game_mode": True,
     "notify": True,
     "lite": False,
-    "auto_update": True,
     "theme": "auto",
     "gallery_sort": "new",
     "img_format": "png",
@@ -1257,9 +1264,8 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.2.0"          # bump this before every release build, and tag the release the same (v1.0.1)
+APP_VERSION = "1.2.1"          # bump this before every release build, and tag the release the same (v1.0.1)
 UPDATE_REPO = "ahhmilo/Helpy"
-FORCE_UPDATE = True            # True: the prompt only offers "Update now" or "Exit Helpy" (no "Later"), and the startup check can't be turned off
 UPD = {"info": None, "busy": False}
 
 
@@ -1269,35 +1275,60 @@ def _ver(t):
     return tuple(n + [0] * (4 - len(n)))
 
 
+def _split_marker(body):
+    """A release is an important (forced) update when its notes contain a line that is just [important].
+    Returns (important, notes_without_that_line)."""
+    import re
+    body = str(body or "")
+    pat = re.compile(r"^[ \t]*\[\s*important\s*\][ \t]*\r?\n?", re.I | re.M)
+    return bool(pat.search(body)), pat.sub("", body).strip()
+
+
 def fetch_update_info():
-    """Asks GitHub for the latest release. Returns a dict for the UI."""
+    """Looks at the GitHub releases newer than this version. Important updates can't be skipped:
+    if any newer release is marked [important], the prompt is forced even when a later release isn't."""
     import urllib.request
     try:
         req = urllib.request.Request(
-            f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+            f"https://api.github.com/repos/{UPDATE_REPO}/releases?per_page=20",
             headers={"User-Agent": f"Helpy/{APP_VERSION}", "Accept": "application/vnd.github+json"})
         with urllib.request.urlopen(req, timeout=10) as r:
             j = json.loads(r.read().decode("utf-8"))
     except Exception:
         return {"ok": False, "msg": "Couldn't check for updates. Check your connection and try again."}
-    tag = str(j.get("tag_name", ""))
-    asset = None
-    for a in j.get("assets") or []:
-        n = str(a.get("name", "")).lower()
-        if n.endswith(".exe") and (asset is None or n == "helpy.exe"):
-            asset = a
-    dg = str((asset or {}).get("digest") or "")
+    cur, newer = _ver(APP_VERSION), []
+    for r in j if isinstance(j, list) else []:
+        if r.get("draft") or r.get("prerelease"):
+            continue
+        tag = str(r.get("tag_name", ""))
+        if _ver(tag) <= cur:
+            continue
+        asset = None
+        for a in r.get("assets") or []:
+            n = str(a.get("name", "")).lower()
+            if n.endswith(".exe") and (asset is None or n == "helpy.exe"):
+                asset = a
+        forced, notes = _split_marker(r.get("body"))
+        newer.append({"tag": tag, "v": _ver(tag), "forced": forced, "notes": notes, "asset": asset,
+                      "page": str(r.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases/latest")})
+    target = max((c for c in newer if c["asset"]), key=lambda c: c["v"], default=None)
+    if not target:
+        UPD["info"] = None
+        return {"ok": True, "available": False, "current": APP_VERSION, "version": APP_VERSION}
+    req_tag = next((c["tag"] for c in sorted(newer, key=lambda c: c["v"]) if c["forced"]), None)
+    notes = target["notes"]
+    if req_tag and not target["forced"]:
+        notes = f"Includes the important update {req_tag}.\n\n" + notes
+    a = target["asset"]
+    dg = str(a.get("digest") or "")
     info = {
-        "version": tag.lstrip("vV"),
-        "notes": str(j.get("body") or "").strip()[:1500],
-        "page": str(j.get("html_url") or f"https://github.com/{UPDATE_REPO}/releases/latest"),
-        "url": (asset or {}).get("browser_download_url", ""),
-        "size": int((asset or {}).get("size") or 0),
+        "version": target["tag"].lstrip("vV"), "notes": notes[:1500], "page": target["page"],
+        "url": a.get("browser_download_url", ""), "size": int(a.get("size") or 0),
         "sha256": dg.split(":", 1)[1] if dg.lower().startswith("sha256:") else "",
     }
     UPD["info"] = info
-    return {"ok": True, "available": bool(asset and _ver(tag) > _ver(APP_VERSION)), "current": APP_VERSION,
-            "version": info["version"], "notes": info["notes"], "force": FORCE_UPDATE, "can_install": IS_EXE}
+    return {"ok": True, "available": True, "current": APP_VERSION, "version": info["version"], "notes": info["notes"],
+            "force": bool(req_tag), "can_install": IS_EXE}
 
 
 def _download_file(url, dest, want_size=0, want_sha="", on_progress=None):
@@ -1401,8 +1432,9 @@ def fetch_changelog():
         if r.get("draft"):
             continue
         tag = str(r.get("tag_name", ""))
-        items.append({"tag": tag, "date": str(r.get("published_at") or "")[:10],
-                      "body": str(r.get("body") or "").strip()[:3000], "current": _ver(tag) == _ver(APP_VERSION)})
+        imp, notes = _split_marker(r.get("body"))
+        items.append({"tag": tag, "date": str(r.get("published_at") or "")[:10], "important": imp,
+                      "body": notes[:3000], "current": _ver(tag) == _ver(APP_VERSION)})
     return {"ok": True, "items": items}
 # --- end updater -----------------------------------------------------------
 
@@ -1425,7 +1457,6 @@ class Api:
         cur["game_mode"] = bool(s.get("game_mode", True))
         cur["notify"] = bool(s.get("notify", True))
         cur["lite"] = bool(s.get("lite", False))
-        cur["auto_update"] = bool(s.get("auto_update", True))
         cur["theme"] = s.get("theme") if s.get("theme") in ("auto", "light", "dark") else "auto"
         cur["gallery_sort"] = s.get("gallery_sort") if s.get("gallery_sort") in ("new", "old", "az", "za", "big") else "new"
         cur["img_format"] = s.get("img_format") if s.get("img_format") in ("png", "jpg", "webp") else "png"
@@ -1636,10 +1667,13 @@ class Api:
         quit_app()  # really quits (tray menu -> Quit Helpy, or the forced-update prompt)
 
     def app_info(self):
-        return {"version": APP_VERSION, "exe": IS_EXE, "force": FORCE_UPDATE}
+        return {"version": APP_VERSION, "exe": IS_EXE}
 
-    def check_update(self):
-        return fetch_update_info()
+    def check_update(self, auto=False):
+        r = fetch_update_info()
+        if auto and r.get("ok") and r.get("available") and r.get("force"):
+            show_window()  # an important update shouldn't sit unseen in the tray
+        return r
 
     def start_update(self):
         info = UPD["info"]
@@ -1938,6 +1972,19 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
 .ddi svg{opacity:0;transform:scale(.5);transition:opacity .2s,transform .35s var(--spring)}.ddi.on svg{opacity:1;transform:none}
 .dd.open .ddi{animation:ddi .32s var(--ease) both;animation-delay:calc(var(--k)*32ms + 50ms)}
 @keyframes ddi{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
+
+.note:empty{display:none}
+.sl #clog div{display:block;justify-content:initial;font-weight:400}
+.sl #clog .clh{display:flex;align-items:center;justify-content:flex-start;gap:10px;margin-bottom:8px;font-weight:600}
+.sl #clog .clh b{font-size:15px}
+.cn h4{margin:12px 0 5px;font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mu)}
+.cn h4:first-child{margin-top:0}
+.cn ul{list-style:none;margin:0;padding:0}
+.cn li{position:relative;padding:3px 0 3px 16px;font-size:13px;line-height:1.5;color:var(--tx)}
+.cn li:before{content:'';position:absolute;left:3px;top:11px;width:5px;height:5px;border-radius:50%;background:var(--ac)}
+.cn p{margin:0 0 6px;font-size:13px;line-height:1.5;color:var(--mu)}
+.uw{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad);border-radius:10px;padding:9px 12px;font-size:13px;font-weight:500;margin:0 0 12px}
+.climp{background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad);border-radius:99px;padding:2px 9px;font-size:11px;font-weight:600}
 </style></head><body>
 <div id="app">
  <header>
@@ -2034,7 +2081,6 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
    <h3 style="margin-top:22px">Updates</h3>
    <div class="grp" style="max-width:640px">
     <div class="sl"><div><span>Helpy <b id="s_ver"></b></span><button class="mod" id="s_updbtn" onclick="checkUpd(true)">Check for updates</button></div><p class="note" id="s_updmsg" style="margin:8px 0 0"></p></div>
-    <div class="sl"><div><span>Check for updates when Helpy starts</span><label class="sw"><input type="checkbox" id="s_auto" onchange="saveSet()"><i></i></label></div></div>
    </div>
    <h3 style="margin-top:22px">Changelog</h3>
    <div class="grp" style="max-width:640px">
@@ -2045,7 +2091,8 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
 </div>
 <div id="toast"></div>
 <div id="upd"><div class="ubox">
- <div class="ut">Update available</div><div class="uv" id="uv"></div>
+ <div class="ut" id="ut">Update available</div><div class="uv" id="uv"></div>
+ <div class="uw" id="uw" style="display:none">This is an important update. Update now to keep using Helpy, or exit.</div>
  <pre class="un" id="un"></pre>
  <div class="ubar" id="ubar"><i id="ubi"></i></div><div class="us" id="us"></div>
  <div class="ubtns" id="ubtns"><button class="btn" id="ub_go" onclick="updGo()">Update now</button><button class="btn sec" id="ub_no" onclick="updLater()">Later</button></div>
@@ -2177,10 +2224,19 @@ function slide(el,save){
  if(save){clearTimeout(CT);CT=null;push(true)}else if(!CT)CT=setTimeout(()=>{CT=null;push(false)},40)}
 async function push(save){const d=S.devices[D],r=await api().set_color(d.name,d.color,save);if(!r.ok)toast(r.msg,true)}
 async function resetColor(){const d=S.devices[D];d.color=await api().reset_color(d.name);renderColor();toast('Color reset')}
+/* a box inside the page that can scroll on its own (like the changelog) gets the wheel first */
+function innerScroll(e,root){
+ let n=e.target;
+ while(n&&n!==root&&n.nodeType===1){
+  const oy=getComputedStyle(n).overflowY;
+  if((oy==='auto'||oy==='scroll')&&n.scrollHeight>n.clientHeight+1){
+   if((e.deltaY<0&&n.scrollTop>0)||(e.deltaY>0&&n.scrollTop+n.clientHeight<n.scrollHeight-1))return true}
+  n=n.parentElement}
+ return false}
 function smooth(el){
  let t=0,raf=0,n=0;
  const step=()=>{const d=t-el.scrollTop;if(Math.abs(d)<1||++n>140){el.scrollTop=t;raf=0;n=0;return}let s=d*.14;if(Math.abs(s)<1)s=Math.sign(d);el.scrollTop+=s;raf=requestAnimationFrame(step)};
- el.addEventListener('wheel',e=>{if(e.ctrlKey)return;cancelAnimationFrame(el._an||0);if(LITE)return;e.preventDefault();if(!raf)t=el.scrollTop;
+ el.addEventListener('wheel',e=>{if(e.ctrlKey)return;cancelAnimationFrame(el._an||0);if(LITE||innerScroll(e,el))return;e.preventDefault();if(!raf)t=el.scrollTop;
   t=Math.max(0,Math.min(el.scrollHeight-el.clientHeight,t+e.deltaY*(e.deltaMode==1?40:1)));if(!raf)raf=requestAnimationFrame(step)},{passive:false})}
 document.querySelectorAll('main,aside').forEach(smooth);
 let ST=null,G={items:[],folder:''},LB=-1,IO=null,CAPK=null,DELT=null;
@@ -2212,9 +2268,9 @@ function renderKeys(){
 async function saveST(){ST.enabled=$('sen').checked;ST=await api().set_settings(ST);renderKeys()}
 function mod(k,m){ST[k][m]=!ST[k][m];saveST()}
 function capKey(k){CAPK=k;const b=document.querySelector(`#krow_${k} .key`);b.textContent='Press a key…';b.classList.add('cap')}
-function renderSet(){renderSnd();applyTheme();renderFmt();$('s_lite').checked=!!ST.lite;$('s_auto').checked=ST.auto_update!==false||FORCEUPD;$('s_auto').disabled=FORCEUPD;applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
+function renderSet(){renderSnd();applyTheme();renderFmt();$('s_lite').checked=!!ST.lite;applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
 async function saveSet(){
- ST.lite=$('s_lite').checked;ST.auto_update=$('s_auto').checked;ST.game_mode=$('s_game').checked;ST.notify=$('s_notify').checked;ST.sound=$('s_snd').checked;ST.volume=+$('s_vol').value;ST.quiet_fullscreen=$('s_quiet').checked;ST.sound_fs_only=$('s_fsonly').checked;
+ ST.lite=$('s_lite').checked;ST.game_mode=$('s_game').checked;ST.notify=$('s_notify').checked;ST.sound=$('s_snd').checked;ST.volume=+$('s_vol').value;ST.quiet_fullscreen=$('s_quiet').checked;ST.sound_fs_only=$('s_fsonly').checked;
  await api().set_startup($('s_start').checked);ST=await api().set_settings(ST);renderKeys()}
 let LBF=false,LBA=false,UIT=null;
 function lbUi(){const l=$('lb');l.classList.add('ui');clearTimeout(UIT);if(LBF)UIT=setTimeout(()=>l.classList.remove('ui'),2500)}
@@ -2325,8 +2381,8 @@ document.addEventListener('keydown',e=>{
 document.addEventListener('keydown',e=>{if(!open())return;if(e.key=='Enter')keep();if(e.key=='Escape')undo()});
 $('q').oninput=renderList;
 window.addEventListener('pywebviewready',async()=>{ST=await api().get_settings();applyLite();applyTheme();GALL.sort=ST.gallery_sort||'new';ddRender();renderKeys();refresh(true);api().unseen_count().then(setBadge);
- api().app_info().then(i=>{FORCEUPD=!!i.force;$('s_ver').textContent='v'+i.version;renderSet();
-  if(ST.auto_update!==false||FORCEUPD){setTimeout(()=>checkUpd(false),3000);setInterval(()=>{if(!$('upd').classList.contains('show'))checkUpd(false)},6*3600*1000)}})});
+ api().app_info().then(i=>{$('s_ver').textContent='v'+i.version;renderSet();
+  setTimeout(()=>checkUpd(false),3000);setInterval(()=>{if(!$('upd').classList.contains('show'))checkUpd(false)},6*3600*1000)})});
 
 /* ---- maximize ---- */
 async function maxi(){setMax(await api().toggle_maximize())}
@@ -2554,9 +2610,9 @@ $('lb').addEventListener('mousedown',e=>{LBD=e.target});
 $('lb').addEventListener('click',e=>{if(ED||LB<0)return;if(lbBg(e.target)&&lbBg(LBD)){if(LBF)lbFull();else closeLB()}});
 
 /* ---- updater ---- */
-var UI_UPD=null,FORCEUPD=false;
+var UI_UPD=null;
 function updShow(r){
- UI_UPD=r;$('uv').textContent=`v${r.current}  →  v${r.version}`;
+ UI_UPD=r;$('ut').textContent=r.force?'Important update':'Update available';$('uw').style.display=r.force?'':'none';$('uv').textContent=`v${r.current}  →  v${r.version}`;
  $('un').textContent=r.notes||'';$('un').style.display=r.notes?'':'none';
  $('us').textContent='';$('us').classList.remove('bad');$('ubar').style.display='none';$('ubi').style.width='0';
  const go=$('ub_go'),no=$('ub_no');go.disabled=false;go.textContent=r.can_install?'Update now':'Open download page';
@@ -2578,7 +2634,7 @@ function updFail(m){$('us').classList.add('bad');$('us').textContent=m;$('ubar')
 async function checkUpd(manual){
  const b=$('s_updbtn');
  if(manual){b.disabled=true;$('s_updmsg').textContent='Checking…'}
- let r;try{r=await api().check_update()}catch(e){r={ok:false,msg:'Couldn\'t check for updates.'}}
+ let r;try{r=await api().check_update(!manual)}catch(e){r={ok:false,msg:'Couldn\'t check for updates.'}}
  if(manual)b.disabled=false;
  if(!r.ok){if(manual)$('s_updmsg').textContent=r.msg;return}
  if(r.available){
@@ -2647,7 +2703,7 @@ async function toggleClog(){
  if(!r.ok){p.innerHTML=`<div class="cl"><small>${esc(r.msg)}</small></div>`;return}
  CLOG=r;
  const fd=d=>{const t=new Date(d+'T00:00:00');return isNaN(t)?d:t.toLocaleDateString(undefined,{year:'numeric',month:'short',day:'numeric'})};
- p.innerHTML=r.items.length?r.items.map(x=>`<div class="cl"><div class="clh"><b>${esc(x.tag)}</b>${x.current?'<span class="clcur">Installed</span>':''}<small>${esc(fd(x.date))}</small></div><pre>${esc(x.body||'No notes for this release.')}</pre></div>`).join(''):'<div class="cl"><small>No releases yet.</small></div>'}
+ p.innerHTML=r.items.length?r.items.map(x=>`<div class="cl"><div class="clh"><b>${esc(x.tag)}</b>${x.current?'<span class="clcur">Installed</span>':''}${x.important?'<span class="climp">Important</span>':''}<small>${esc(fd(x.date))}</small></div><div class="cn">${fmtNotes(x.body)}</div></div>`).join(''):'<div class="cl"><small>No releases yet.</small></div>'}
 
 /* ---- sort dropdown ---- */
 var DDT=null;
@@ -2672,6 +2728,22 @@ function ddKey(e){
  else if(e.key=='Escape'){e.preventDefault();e.stopPropagation();ddToggle(false);$('gsortb').focus()}
  else if(e.key=='Tab')ddToggle(false)}
 document.addEventListener('mousedown',e=>{if(ddOpen()&&!$('gdd').contains(e.target))ddToggle(false)});
+
+/* ---- release notes -> tidy sections and bullets ---- */
+function fmtNotes(t){
+ const lines=String(t||'').replace(/\r/g,'').split('\n');
+ while(lines.length&&(!lines[0].trim()||/^\s*(helpy\s+)?v?\d+(\.\d+)*\s*$/i.test(lines[0])))lines.shift();
+ let out='',list=false;
+ const close=()=>{if(list){out+='</ul>';list=false}};
+ for(const raw of lines){
+  const l=raw.trimEnd(),tx=l.trim();
+  if(!tx){close();continue}
+  let m;
+  if((m=tx.match(/^#{1,4}\s+(.*)$/))||(m=tx.match(/^([A-Za-z][\w &/-]{0,30}):$/))){close();out+=`<h4>${esc(m[1])}</h4>`}
+  else if((m=tx.match(/^[-*•]\s+(.*)$/))){if(!list){out+='<ul>';list=true}out+=`<li>${esc(m[1])}</li>`}
+  else if(list&&/^\s/.test(l)){out=out.replace(/<\/li>$/,' '+esc(tx)+'</li>')}
+  else{close();out+=`<p>${esc(tx)}</p>`}}
+ close();return out||'<p>No notes for this release.</p>'}
 </script></body></html>
 """
 

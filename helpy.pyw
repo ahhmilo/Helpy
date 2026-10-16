@@ -5,7 +5,6 @@ Helpy - resolution + refresh rate switcher for Windows (pywebview UI).
   python helpy.pyw
   python helpy.pyw --apply "Gaming"     # apply a preset without opening the UI
 """
-
 import argparse, ctypes, json, os, sys
 from ctypes import wintypes
 
@@ -333,6 +332,7 @@ DEF_SETTINGS = {
     "notify": True,
     "lite": False,
     "theme": "auto",
+    "audio_device": "",
     "gallery_sort": "new",
     "img_format": "png",
     "img_quality": 92,
@@ -1264,7 +1264,7 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.2.1"          # bump this before every release build, and tag the release the same (v1.0.1)
+APP_VERSION = "1.3.0"          # bump this before every release build, and tag the release the same (v1.0.1)
 UPDATE_REPO = "ahhmilo/Helpy"
 UPD = {"info": None, "busy": False}
 
@@ -1439,6 +1439,235 @@ def fetch_changelog():
 # --- end updater -----------------------------------------------------------
 
 
+# --- display hot-plug watcher ----------------------------------------------
+def display_signature():
+    try:
+        return tuple((d["name"], d["monitor"], tuple((current_mode(d["name"]) or {}).get(k) for k in ("w", "h", "hz")))
+                     for d in list_devices())
+    except Exception:
+        return None
+
+
+def display_watcher(interval=2.0):
+    """Tells the UI when a monitor is plugged in, removed or changed, so the lists never go stale."""
+    last = display_signature()
+    names = tuple(x[0] + x[1] for x in last) if last else ()
+    while True:
+        time.sleep(interval)
+        sig = display_signature()
+        if sig is None or sig == last:
+            continue
+        last = sig
+        new_names = tuple(x[0] + x[1] for x in sig)
+        if new_names != names:  # a monitor came or went: put the saved colors back on the new set
+            names = new_names
+            try:
+                apply_saved_colors()
+            except Exception:
+                pass
+        try:
+            WINDOW.evaluate_js("displaysChanged()")
+        except Exception:
+            pass
+
+
+# --- audio recorder (records through Windows' normal audio path, so Equalizer APO etc. apply) ----------
+AUDIO = {"stream": None, "frames": [], "n": 0, "rate": 48000, "level": -90.0, "peak_hold": -90.0,
+         "all_peak": -90.0, "wav": None, "full": False}
+AUDIO_LOCK = threading.Lock()
+MAX_REC_SECS = 600
+
+
+def _db(v):
+    import math
+    return -90.0 if v <= 3e-5 else max(-90.0, 20 * math.log10(v))
+
+
+def apo_info():
+    """Is Equalizer APO installed?"""
+    try:
+        import winreg
+    except Exception:
+        return {"found": False, "path": ""}
+    for flag in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\EqualizerAPO", 0, winreg.KEY_READ | flag) as k:
+                return {"found": True, "path": str(winreg.QueryValueEx(k, "InstallPath")[0])}
+        except OSError:
+            continue
+    for p in (r"C:\Program Files\EqualizerAPO", r"C:\Program Files (x86)\EqualizerAPO"):
+        if os.path.isdir(p):
+            return {"found": True, "path": p}
+    return {"found": False, "path": ""}
+
+
+def audio_devices():
+    try:
+        import sounddevice as sd
+    except Exception:
+        return {"ok": False, "msg": "Recording needs the 'sounddevice' package. Install it with: pip install sounddevice"}
+    try:
+        if AUDIO["stream"] is None:  # PortAudio only sees microphones that existed at start-up, so re-scan
+            try:
+                sd._terminate()
+                sd._initialize()
+            except Exception:
+                pass
+        apis, devs = sd.query_hostapis(), sd.query_devices()
+        wasapi = next((i for i, h in enumerate(apis) if "WASAPI" in h["name"]), None)
+        out, seen = [], set()
+        for i, d in enumerate(devs):
+            if d["max_input_channels"] < 1 or (wasapi is not None and d["hostapi"] != wasapi):
+                continue
+            key = d["name"].strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"id": i, "name": d["name"].strip()})
+        default = apis[wasapi]["default_input_device"] if wasapi is not None else sd.default.device[0]
+        if not out:
+            return {"ok": False, "msg": "No microphone found. Plug one in and come back to this tab."}
+        return {"ok": True, "devices": out, "default": default, "apo": apo_info()}
+    except Exception as e:
+        return {"ok": False, "msg": f"Couldn't list microphones: {e}"}
+
+
+def _audio_cb(indata, frames, tinfo, status):
+    import numpy as np
+    x = indata[:, 0].astype(np.float32) / 32768.0
+    rms = float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
+    pk = float(np.max(np.abs(x))) if len(x) else 0.0
+    with AUDIO_LOCK:
+        AUDIO["frames"].append(indata.copy())
+        AUDIO["n"] += frames
+        AUDIO["level"] = _db(rms)
+        p = _db(pk)
+        AUDIO["peak_hold"] = max(AUDIO["peak_hold"], p)
+        AUDIO["all_peak"] = max(AUDIO["all_peak"], p)
+        if AUDIO["n"] >= AUDIO["rate"] * MAX_REC_SECS:
+            AUDIO["full"] = True
+
+
+def audio_start(dev):
+    if AUDIO["stream"] is not None:
+        return {"ok": True}
+    try:
+        import sounddevice as sd
+        info = sd.query_devices(int(dev))
+        rate = int(info["default_samplerate"]) or 48000
+        kw = dict(device=int(dev), channels=1, samplerate=rate, dtype="int16", callback=_audio_cb)
+        try:  # shared mode + automatic format conversion: goes through the Windows audio engine (and its APOs)
+            if "WASAPI" in sd.query_hostapis(info["hostapi"])["name"]:
+                kw["extra_settings"] = sd.WasapiSettings(auto_convert=True)
+        except Exception:
+            pass
+        with AUDIO_LOCK:
+            AUDIO.update(frames=[], n=0, rate=rate, level=-90.0, peak_hold=-90.0, all_peak=-90.0, full=False, wav=None)
+        st = sd.InputStream(**kw)
+        st.start()
+        AUDIO["stream"] = st
+        return {"ok": True, "rate": rate}
+    except Exception as e:
+        return {"ok": False, "msg": "Couldn't open that microphone. Another app may have it to itself, or Windows is blocking it "
+                                    "(Settings > Privacy & security > Microphone). " + str(e)[:90]}
+
+
+def audio_level():
+    with AUDIO_LOCK:
+        r = {"rec": AUDIO["stream"] is not None, "level": AUDIO["level"], "peak": AUDIO["peak_hold"],
+             "secs": AUDIO["n"] / max(1, AUDIO["rate"]), "full": AUDIO["full"]}
+        AUDIO["peak_hold"] = -90.0
+    return r
+
+
+def audio_stop():
+    import wave
+    import numpy as np
+    st = AUDIO["stream"]
+    if st is None:
+        return {"ok": False, "msg": "Not recording."}
+    try:
+        st.stop()
+        st.close()
+    except Exception:
+        pass
+    AUDIO["stream"] = None
+    with AUDIO_LOCK:
+        frames, rate, allpeak = AUDIO["frames"], AUDIO["rate"], AUDIO["all_peak"]
+        AUDIO["frames"] = []
+    if not frames:
+        return {"ok": False, "msg": "Nothing was recorded."}
+    data = np.concatenate(frames)
+    folder = os.path.join(os.path.dirname(PRESET_FILE), "recordings")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "recording.wav")
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(data.tobytes())
+    AUDIO["wav"] = path
+    return {"ok": True, "secs": len(data) / rate, "rate": rate, "size": os.path.getsize(path),
+            "silent": allpeak < -75.0, "peak": allpeak}
+
+
+def audio_chunk(off, n):
+    import base64
+    p = AUDIO["wav"]
+    if not p or not os.path.exists(p):
+        return ""
+    with open(p, "rb") as f:
+        f.seek(int(off))
+        return base64.b64encode(f.read(int(n))).decode()
+
+
+def audio_discard():
+    p, AUDIO["wav"] = AUDIO["wav"], None
+    try:
+        if p and os.path.exists(p):
+            os.remove(p)
+    except OSError:
+        pass
+
+
+def audio_abort():
+    st = AUDIO["stream"]
+    AUDIO["stream"] = None
+    try:
+        if st is not None:
+            st.stop()
+            st.close()
+    except Exception:
+        pass
+
+
+def _restart_script(pid, args):
+    """Batch file: waits for this Helpy to exit, then starts a fresh one."""
+    q = " ".join('"%s"' % a.replace("%", "%%") for a in args)
+    return ("@echo off\r\nchcp 65001 >nul\r\nset /a n=0\r\n:wait\r\n"
+            f'tasklist /fi "PID eq {pid}" 2>nul | find "{pid}" >nul\r\n'
+            "if errorlevel 1 goto go\r\nset /a n+=1\r\nif %n% GEQ 30 goto go\r\n"
+            "ping -n 2 127.0.0.1 >nul\r\ngoto wait\r\n:go\r\n"
+            "set PYINSTALLER_RESET_ENVIRONMENT=1\r\n"
+            f"start \"\" {q}\r\n"
+            '(goto) 2>nul & del "%~f0"\r\n')
+
+
+def restart_app():
+    try:
+        exe = os.path.abspath(sys.executable)
+        args = [exe] if IS_EXE else [exe, os.path.abspath(sys.argv[0])]
+        bat = os.path.join(tempfile.gettempdir(), "helpy_restart.bat")
+        with open(bat, "w", encoding="utf-8", newline="") as f:
+            f.write(_restart_script(os.getpid(), args))
+        env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+        subprocess.Popen(["cmd", "/c", bat], env=env, creationflags=0x08000000 | 0x00000200, close_fds=True,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        return
+    quit_app()
+
+
 class Api:
     def get_settings(self):
         return {**load_settings(), **_startup_info()}
@@ -1458,6 +1687,7 @@ class Api:
         cur["notify"] = bool(s.get("notify", True))
         cur["lite"] = bool(s.get("lite", False))
         cur["theme"] = s.get("theme") if s.get("theme") in ("auto", "light", "dark") else "auto"
+        cur["audio_device"] = str(s.get("audio_device", ""))[:200]
         cur["gallery_sort"] = s.get("gallery_sort") if s.get("gallery_sort") in ("new", "old", "az", "za", "big") else "new"
         cur["img_format"] = s.get("img_format") if s.get("img_format") in ("png", "jpg", "webp") else "png"
         try:
@@ -1665,6 +1895,43 @@ class Api:
 
     def exit(self):
         quit_app()  # really quits (tray menu -> Quit Helpy, or the forced-update prompt)
+
+    # ---- audio tab
+    def audio_devices(self):
+        return audio_devices()
+
+    def audio_start(self, dev):
+        return audio_start(dev)
+
+    def audio_level(self):
+        return audio_level()
+
+    def audio_stop(self):
+        return audio_stop()
+
+    def audio_chunk(self, off, n):
+        return audio_chunk(off, n)
+
+    def audio_discard(self):
+        audio_discard()
+        return True
+
+    def audio_save(self):
+        import shutil
+        import webview
+        p = AUDIO["wav"]
+        if not p or not os.path.exists(p):
+            return {"ok": False, "msg": "There's no recording to save."}
+        kind = webview.FileDialog.SAVE if hasattr(webview, "FileDialog") else webview.SAVE_DIALOG
+        name = datetime.datetime.now().strftime("Helpy recording %Y-%m-%d %H-%M-%S.wav")
+        r = WINDOW.create_file_dialog(kind, save_filename=name, file_types=("WAV audio (*.wav)",))
+        if not r:
+            return {"ok": False, "cancelled": True}
+        dest = r if isinstance(r, str) else r[0]
+        if not dest.lower().endswith(".wav"):
+            dest += ".wav"
+        shutil.copyfile(p, dest)
+        return {"ok": True, "path": dest}
 
     def app_info(self):
         return {"version": APP_VERSION, "exe": IS_EXE}
@@ -1985,11 +2252,40 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
 .cn p{margin:0 0 6px;font-size:13px;line-height:1.5;color:var(--mu)}
 .uw{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad);border-radius:10px;padding:9px 12px;font-size:13px;font-weight:500;margin:0 0 12px}
 .climp{background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad);border-radius:99px;padding:2px 9px;font-size:11px;font-weight:600}
+
+/* ---- 4 tabs ---- */
+#nav{width:528px}
+.recdot{display:none;width:8px;height:8px;border-radius:50%;background:#ff453a;margin-left:7px;vertical-align:middle;animation:recp 1.2s ease-in-out infinite}
+.recdot.on{display:inline-block}
+@keyframes recp{50%{opacity:.35;transform:scale(.8)}}
+/* ---- audio tab ---- */
+.au{max-width:720px}
+.aucard{background:var(--card);border-radius:18px;padding:20px 22px;margin-bottom:16px}
+.aulab{font-size:12px;font-weight:600;color:var(--mu);text-transform:uppercase;letter-spacing:.05em;margin:0 0 10px}
+.dd.wide{width:100%}.dd.wide .ddb{width:100%;justify-content:space-between;background:var(--card2)}
+.dd.wide .ddb span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}
+.dd.wide .ddm{width:100%;max-height:260px;overflow:auto}.dd.wide .ddi span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ddb[disabled]{opacity:.5;pointer-events:none}
+.mtop{display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:12px}
+.mdb{font-size:46px;font-weight:700;letter-spacing:-.03em;font-variant-numeric:tabular-nums;line-height:1}.mdb small{font-size:16px;font-weight:500;color:var(--mu);margin-left:6px}
+.autime{font-variant-numeric:tabular-nums;font-size:22px;font-weight:600;color:var(--mu);transition:color .3s}.autime.on{color:var(--tx)}
+.mtr{position:relative;height:14px;border-radius:99px;background:var(--card2);overflow:hidden}
+.mtr i{position:absolute;inset:0;background:linear-gradient(90deg,#30d158 0,#30d158 70%,#ffd60a 70%,#ffd60a 90%,#ff453a 90%);clip-path:inset(0 100% 0 0);transition:clip-path .07s linear}
+.mtr b{position:absolute;top:0;bottom:0;width:3px;border-radius:2px;background:var(--tx);left:0;opacity:0;transition:left .07s linear,opacity .25s}
+.mscale{display:flex;justify-content:space-between;font-size:11px;color:var(--mu);margin-top:6px;font-variant-numeric:tabular-nums}
+#awave{width:100%;height:84px;display:block;border-radius:12px;background:var(--card2);margin-top:14px}
+.recbtn{display:inline-flex;align-items:center;gap:10px;background:#ff2d55;color:#fff;border-radius:14px;padding:13px 22px;font-size:15px;font-weight:600;transition:background .2s,transform .25s var(--spring)}
+.recbtn:hover{background:#e0244a}.recbtn:active{transform:scale(.96)}.recbtn[disabled]{opacity:.45;pointer-events:none}
+.recbtn .rd{display:block;width:12px;height:12px;border-radius:50%;background:#fff;transition:border-radius .25s,background .25s}
+.recbtn.on{background:var(--card2);color:var(--tx)}.recbtn.on:hover{background:var(--hv)}.recbtn.on .rd{border-radius:3px;background:#ff453a}
+#ares{animation:fade .35s var(--ease)}
+.apo{display:flex;gap:12px;align-items:flex-start}.apo i{flex:none;width:10px;height:10px;border-radius:50%;background:var(--ok);margin-top:5px}
+.apo b{display:block;margin-bottom:3px}.apo span{color:var(--mu);font-size:13px;line-height:1.5}
 </style></head><body>
 <div id="app">
  <header>
   <div id="drag" class="pywebview-drag-region"><i></i>Helpy</div>
-  <div class="seg" id="nav" style="--n:3;--i:0"><div class="thumb"></div><button class="sg on" onclick="page(0)">Display</button><button class="sg" onclick="page(1)">Screenshots<b class="badge" id="badge"></b></button><button class="sg" onclick="page(2)">Settings</button></div>
+  <div class="seg" id="nav" style="--n:4;--i:0"><div class="thumb"></div><button class="sg on" onclick="page(0)">Display</button><button class="sg" onclick="page(1)">Screenshots<b class="badge" id="badge"></b></button><button class="sg" onclick="page(2)">Audio<b class="recdot" id="recdot"></b></button><button class="sg" onclick="page(3)">Settings</button></div>
   <div class="pywebview-drag-region" style="flex:1;height:100%" ondblclick="maxi()"></div>
   <button class="wb" onclick="mini()" title="Minimize" aria-label="Minimize"><svg width="12" height="12" viewBox="0 0 12 12"><path d="M1 6h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
   <button class="wb" id="wmax" onclick="maxi()" title="Maximize" aria-label="Maximize"><svg id="wmaxi" width="12" height="12" viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button>
@@ -2052,6 +2348,32 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
    <h3>Capture now</h3>
    <div class="form"><button class="btn full" onclick="api().capture('region')">Region</button><button class="btn sec full" onclick="api().capture('full')">Full screen</button></div>
   </aside>
+ </div>
+ <div id="audio" class="page" style="grid-template-columns:1fr">
+  <main id="amain">
+   <div class="ghead"><div><div class="gt">Audio</div><div class="mon">Record your voice and watch the level</div></div></div>
+   <div class="au">
+    <div class="aucard">
+     <div class="aulab">Microphone</div>
+     <div class="dd wide" id="adev"><button class="ddb" aria-haspopup="listbox" aria-expanded="false"><span>Loading…</span><svg width="12" height="12" viewBox="0 0 12 12"><path d="M2.5 4.5L6 8l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div class="ddm" role="listbox"><div class="ddh">Input device</div><div data-items></div></div></div>
+     <p class="note" id="amsg" style="margin:10px 0 0"></p>
+    </div>
+    <div class="aucard">
+     <div class="mtop"><div class="mdb"><span id="adb">&#8722;&#8734;</span><small>dB</small></div><div class="autime" id="atime">0:00</div></div>
+     <div class="mtr"><i id="afill"></i><b id="apeak"></b></div>
+     <div class="mscale"><span>-60</span><span>-48</span><span>-36</span><span>-24</span><span>-12</span><span>0 dB</span></div>
+     <canvas id="awave"></canvas>
+     <div style="display:flex;align-items:center;gap:14px;margin-top:16px"><button class="recbtn" id="arec" onclick="aToggle()"><i class="rd"></i><span id="arect">Start recording</span></button><span class="note" id="astat" style="margin:0"></span></div>
+    </div>
+    <div class="aucard" id="ares" style="display:none">
+     <div class="aulab">Your recording</div>
+     <audio id="aplay" controls style="width:100%"></audio>
+     <div class="note" id="ainfo" style="margin:10px 0 14px"></div>
+     <div style="display:flex;gap:10px"><button class="btn" onclick="aSave()">Download</button><button class="btn sec" onclick="aDiscard()">Discard</button></div>
+    </div>
+    <div class="aucard apo" id="aapo" style="display:none"><i></i><div><b>Equalizer APO detected</b><span>Helpy records through Windows' normal audio path, not through a browser, so whatever Equalizer APO applies to this microphone is included in your recording.</span></div></div>
+   </div>
+  </main>
  </div>
  <div id="setp" class="page" style="grid-template-columns:1fr">
   <main>
@@ -2145,7 +2467,7 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
 </div></div>
 <script>
 const SEC=15,CIRC=2*Math.PI*46;
-let S=null,D=0,PREV=null,PDEV=null,END=0,TM=null,BUSY=false,TT=null;
+let S=null,D=0,PREV=null,PDEV=null,END=0,TM=null,BUSY=false,TT=null;var LASTREF=0,DCT=null;
 const $=id=>document.getElementById(id),api=()=>window.pywebview.api;
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const same=(a,b)=>a&&b&&a.w==b.w&&a.h==b.h&&a.hz==b.hz;
@@ -2153,7 +2475,9 @@ const open=()=>$('ov').classList.contains('show');
 function ratio(w,h){const r=w/h;for(const[a,b]of[[16,9],[16,10],[4,3],[21,9],[5,4],[3,2],[32,9],[43,18]])if(Math.abs(r-a/b)<.012)return a+':'+b;return ''}
 function toast(t,bad){const e=$('toast');e.textContent=t;e.className='show'+(bad?' bad':'');clearTimeout(TT);TT=setTimeout(()=>e.className='',bad?5000:2200)}
 async function refresh(full){
- S=await api().state();if(D>=S.devices.length)D=0;
+ const keep=S&&S.devices[D]?S.devices[D].name:null;
+ S=await api().state();LASTREF=Date.now();
+ {const k=keep?S.devices.findIndex(x=>x.name==keep):-1;D=k>=0?k:(D>=S.devices.length?0:D)}
  if(full){drawSeg();renderList();renderPres()}renderColor();mark()}
 function drawSeg(){
  const s=$('seg'),n=S.devices.length;s.style.display=n>1?'grid':'none';s.style.setProperty('--n',n);s.style.setProperty('--i',D);
@@ -2235,10 +2559,12 @@ function innerScroll(e,root){
  return false}
 function smooth(el){
  let t=0,raf=0,n=0;
+ const edge=e=>{if(el.scrollHeight<=el.clientHeight+1)return true;const cur=raf?t:el.scrollTop;
+  return (e.deltaY<0&&cur<=0)||(e.deltaY>0&&cur>=el.scrollHeight-el.clientHeight-1)};
  const step=()=>{const d=t-el.scrollTop;if(Math.abs(d)<1||++n>140){el.scrollTop=t;raf=0;n=0;return}let s=d*.14;if(Math.abs(s)<1)s=Math.sign(d);el.scrollTop+=s;raf=requestAnimationFrame(step)};
- el.addEventListener('wheel',e=>{if(e.ctrlKey)return;cancelAnimationFrame(el._an||0);if(LITE||innerScroll(e,el))return;e.preventDefault();if(!raf)t=el.scrollTop;
+ el.addEventListener('wheel',e=>{if(e.ctrlKey)return;cancelAnimationFrame(el._an||0);if(LITE||innerScroll(e,el)||(el.id=='clog'||el.id=='un')&&edge(e))return;e.preventDefault();if(!raf)t=el.scrollTop;
   t=Math.max(0,Math.min(el.scrollHeight-el.clientHeight,t+e.deltaY*(e.deltaMode==1?40:1)));if(!raf)raf=requestAnimationFrame(step)},{passive:false})}
-document.querySelectorAll('main,aside').forEach(smooth);
+document.querySelectorAll('main,aside,#clog,#un').forEach(smooth);
 let ST=null,G={items:[],folder:''},LB=-1,IO=null,CAPK=null,DELT=null;
 function vkName(v){const m={44:'PrtScn',45:'Ins',46:'Del',36:'Home',35:'End',33:'PgUp',34:'PgDn',32:'Space',19:'Pause',145:'ScrLk',192:'`',13:'Enter',9:'Tab'};
  if(m[v])return m[v];if(v>=112&&v<=135)return 'F'+(v-111);if((v>=48&&v<=57)||(v>=65&&v<=90))return String.fromCharCode(v);return 'Key '+v}
@@ -2257,7 +2583,7 @@ function page(i){
  if(LB>=0||ED)return;
  const from=PG;PG=i;
  $('nav').style.setProperty('--i',i);document.querySelectorAll('#nav .sg').forEach((b,j)=>b.classList.toggle('on',j==i));
- swapTo([$('body'),$('shots'),$('setp')],from,i,'p');if(i==1)galleryRefresh()}
+ swapTo([$('body'),$('shots'),$('audio'),$('setp')],from,i,'p');if(i==1)galleryRefresh();if(i==2)aInit()}
 function renderKeys(){
  const names={region:'Region screenshot',full:'Full screen screenshot'};
  for(const k of ['region','full']){const b=ST[k];
@@ -2744,6 +3070,122 @@ function fmtNotes(t){
   else if(list&&/^\s/.test(l)){out=out.replace(/<\/li>$/,' '+esc(tx)+'</li>')}
   else{close();out+=`<p>${esc(tx)}</p>`}}
  close();return out||'<p>No notes for this release.</p>'}
+
+/* ---- display hot-plug ---- */
+function displaysChanged(){
+ clearTimeout(DCT);
+ if(!S||BUSY||open()){DCT=setTimeout(displaysChanged,1500);return}
+ refresh(true)}
+window.addEventListener('focus',()=>{
+ if(PG==2&&!AU.rec&&AU.ready)aInit();
+ if(S&&Date.now()-LASTREF>3000)displaysChanged()});
+
+/* ---- generic dropdown (same look as the sort menu) ---- */
+const CHECK_SVG='<svg width="14" height="14" viewBox="0 0 14 14"><path d="M2.5 7.5l3 3 6-6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+function mkDD(root,onPick){
+ const btn=root.querySelector('.ddb'),menu=root.querySelector('.ddm'),box=menu.querySelector('[data-items]');
+ let T=null,items=[];
+ const isOpen=()=>root.classList.contains('open');
+ function set(open){
+  clearTimeout(T);
+  if(open===isOpen()&&!root.classList.contains('out'))return;
+  if(open){root.classList.remove('out');root.classList.add('open');btn.setAttribute('aria-expanded','true');
+   requestAnimationFrame(()=>{const t=box.querySelector('.ddi.on')||box.querySelector('.ddi');if(t)t.focus({preventScroll:true})})}
+  else{btn.setAttribute('aria-expanded','false');
+   if(LITE)root.classList.remove('open','out');else{root.classList.add('out');T=setTimeout(()=>root.classList.remove('open','out'),140)}}}
+ function fill(list,cur){
+  items=list;
+  box.innerHTML=list.map((x,i)=>`<button class="ddi ${String(x.id)===String(cur)?'on':''}" role="option" data-id="${esc(String(x.id))}" style="--k:${i}"><span>${esc(x.label)}</span>${CHECK_SVG}</button>`).join('');
+  box.querySelectorAll('.ddi').forEach(b=>b.onclick=()=>{const it=items.find(x=>String(x.id)===b.dataset.id);set(false);btn.focus({preventScroll:true});if(it)onPick(it)});
+  const c=list.find(x=>String(x.id)===String(cur));btn.querySelector('span').textContent=c?c.label:'Choose…'}
+ btn.onclick=()=>{if(!btn.disabled)set(!isOpen())};
+ menu.onkeydown=e=>{
+  const its=[...box.querySelectorAll('.ddi')],i=its.indexOf(document.activeElement);
+  if(e.key=='ArrowDown'){e.preventDefault();its[(i+1)%its.length].focus()}
+  else if(e.key=='ArrowUp'){e.preventDefault();its[(i-1+its.length)%its.length].focus()}
+  else if(e.key=='Escape'){e.preventDefault();e.stopPropagation();set(false);btn.focus()}
+  else if(e.key=='Tab')set(false)};
+ document.addEventListener('mousedown',e=>{if(isOpen()&&!root.contains(e.target))set(false)});
+ return{fill,set,isOpen}}
+
+/* ---- audio tab: record, level meter, playback, download ---- */
+var AU={dev:null,devs:[],rec:false,poll:null,busy:false,hist:[],sm:-90,pk:-90,pkT:0,url:null,dd:null,ready:false};
+const fmtT=s=>{s=Math.floor(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+function aUi(){
+ $('arec').classList.toggle('on',AU.rec);$('arect').textContent=AU.rec?'Stop recording':'Start recording';
+ $('atime').classList.toggle('on',AU.rec);$('recdot').classList.toggle('on',AU.rec);
+ $('adev').querySelector('.ddb').disabled=AU.rec}
+async function aInit(){
+ if(AU.rec)return;
+ if(!AU.dd)AU.dd=mkDD($('adev'),it=>{AU.dev=AU.devs.find(d=>d.id===it.id);ST.audio_device=AU.dev.name;api().set_settings(ST).then(r=>{ST=r});aFillDev()});
+ const r=await api().audio_devices();
+ AU.ready=true;
+ if(!r.ok){AU.devs=[];AU.dev=null;$('amsg').textContent=r.msg;$('arec').disabled=true;$('adev').querySelector('span').textContent='No microphone';$('aapo').style.display='none';return}
+ $('arec').disabled=false;$('amsg').textContent='';
+ AU.devs=r.devices;
+ const keep=AU.dev&&AU.devs.find(d=>d.name===AU.dev.name),saved=AU.devs.find(d=>d.name===ST.audio_device);
+ AU.dev=keep||saved||AU.devs.find(d=>d.id===r.default)||AU.devs[0];
+ aFillDev();$('aapo').style.display=r.apo&&r.apo.found?'':'none';aDraw()}
+function aFillDev(){AU.dd.fill(AU.devs.map(d=>({id:d.id,label:d.name})),AU.dev?AU.dev.id:null)}
+async function aToggle(){
+ if(AU.rec)return aStop();
+ if(!AU.dev)return;
+ aResetResult();
+ const r=await api().audio_start(AU.dev.id);
+ if(!r.ok){$('amsg').textContent=r.msg;return}
+ $('amsg').textContent='';AU.rec=true;AU.hist=[];AU.sm=-90;AU.pk=-90;aUi();
+ $('astat').textContent='Recording…';
+ AU.poll=setInterval(aPoll,50)}
+async function aPoll(){
+ if(AU.busy)return;AU.busy=true;
+ try{
+  const r=await api().audio_level(),now=Date.now();
+  AU.sm=AU.sm*.55+r.level*.45;
+  if(r.peak>AU.pk||now-AU.pkT>1200){AU.pk=r.peak;AU.pkT=now}
+  const pct=v=>Math.max(0,Math.min(1,(v+60)/60));
+  $('afill').style.clipPath=`inset(0 ${(1-pct(AU.sm))*100}% 0 0)`;
+  const pk=$('apeak');pk.style.left=`calc(${pct(AU.pk)*100}% - 3px)`;pk.style.opacity=AU.pk>-60?1:0;
+  $('adb').textContent=AU.sm<=-89?'\u2212\u221e':Math.round(AU.sm);
+  $('atime').textContent=fmtT(r.secs);
+  AU.hist.push(pct(r.level));aDraw();
+  if(r.full)aStop()}
+ catch(e){}
+ AU.busy=false}
+function aDraw(){
+ const c=$('awave');if(!c||!c.clientWidth)return;
+ const dpr=window.devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;
+ if(c.width!==Math.round(w*dpr)){c.width=Math.round(w*dpr);c.height=Math.round(h*dpr)}
+ const x=c.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);x.clearRect(0,0,w,h);
+ const step=5,n=Math.floor(w/step),ac=getComputedStyle(document.documentElement).getPropertyValue('--ac').trim()||'#0a84ff';
+ const d=AU.hist.slice(-n);
+ for(let i=0;i<n;i++){
+  const v=d[d.length-n+i];const bh=v==null?3:Math.max(3,v*(h-8));
+  x.fillStyle=v==null?'rgba(127,127,127,.25)':ac;x.beginPath();
+  if(x.roundRect)x.roundRect(i*step,(h-bh)/2,3,bh,1.5);else x.rect(i*step,(h-bh)/2,3,bh);x.fill()}}
+async function aStop(){
+ clearInterval(AU.poll);AU.poll=null;
+ while(AU.busy)await new Promise(r=>setTimeout(r,20));
+ const r=await api().audio_stop();AU.rec=false;aUi();
+ $('afill').style.clipPath='inset(0 100% 0 0)';$('apeak').style.opacity=0;$('adb').textContent='\u2212\u221e';
+ if(!r.ok){$('astat').textContent='';$('amsg').textContent=r.msg;return}
+ $('astat').textContent='Preparing playback…';
+ try{
+  const parts=[],N=786432;
+  for(let o=0;o<r.size;o+=N){const b=atob(await api().audio_chunk(o,N)),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);parts.push(u)}
+  if(AU.url)URL.revokeObjectURL(AU.url);
+  AU.url=URL.createObjectURL(new Blob(parts,{type:'audio/wav'}));$('aplay').src=AU.url;
+ }catch(e){$('astat').textContent='';$('amsg').textContent="Couldn't load the recording for playback, but you can still download it.";}
+ $('astat').textContent='';
+ $('atime').textContent=fmtT(r.secs);
+ $('ainfo').textContent=`${fmtT(r.secs)} \u00b7 ${(r.rate/1000).toFixed(1)} kHz \u00b7 mono \u00b7 ${(r.size/1048576).toFixed(1)} MB`;
+ $('amsg').textContent=r.silent?'That recording is silent. Check that your microphone isn\u2019t muted and that Windows allows desktop apps to use it (Settings \u203a Privacy & security \u203a Microphone).':'';
+ $('ares').style.display='';$('ares').style.animation='none';void $('ares').offsetWidth;$('ares').style.animation=''}
+function aResetResult(){const a=$('aplay');a.pause();a.removeAttribute('src');a.load();if(AU.url){URL.revokeObjectURL(AU.url);AU.url=null}$('ares').style.display='none';$('atime').textContent='0:00';AU.hist=[];aDraw()}
+async function aDiscard(){aResetResult();await api().audio_discard();$('amsg').textContent=''}
+async function aSave(){
+ const r=await api().audio_save();
+ if(r.ok)toast('Saved '+String(r.path).split(/[\\/]/).pop());else if(!r.cancelled)toast(r.msg||"Couldn't save the recording",true)}
+window.addEventListener('resize',()=>{if($('audio').classList.contains('on'))aDraw()});
 </script></body></html>
 """
 
@@ -2767,6 +3209,7 @@ def show_window(*_):
 
 
 def quit_app():
+    audio_abort()
     try:
         TRAY.stop()
     except Exception:
@@ -2799,6 +3242,7 @@ def build_tray():
         pystray.MenuItem("Screenshot (full screen)", lambda icon, item: threading.Thread(target=take, args=("full",), daemon=True).start()),
         pystray.MenuItem("Presets", pystray.Menu(presets_menu)),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Restart Helpy", lambda icon, item: threading.Thread(target=restart_app, daemon=True).start()),
         pystray.MenuItem("Quit Helpy", lambda icon, item: quit_app()),
     )
     return pystray.Icon("Helpy", img, "Helpy", menu)
@@ -2837,6 +3281,7 @@ def main():
     TRAY.run_detached()
     update_badge(False)
     start_hook()
+    threading.Thread(target=display_watcher, daemon=True).start()
     webview.start()
     TRAY.stop()
 

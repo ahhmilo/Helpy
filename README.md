@@ -13,7 +13,7 @@ Built with Python, a native Windows API backend and a custom HTML/CSS/JS interfa
 - **Custom modes.** Type any width, height and Hz. If the driver rejects it, you get told instead of a black screen.
 - **Safe changes.** After every switch you get a *Keep / Revert* prompt that reverts automatically if you do nothing.
 - **Presets.** Save a mode with a name and apply it again later.
-- **Multi-monitor.** Pick the display you want to change.
+- **Multi-monitor.** Pick the display you want to change. Plug a monitor in or out and Helpy notices on its own, no restart needed.
 
 ### Color
 - Gamma, brightness, contrast and red/green/blue balance, saved per monitor and re-applied on launch.
@@ -40,10 +40,16 @@ Built with Python, a native Windows API backend and a custom HTML/CSS/JS interfa
 - **Crop** by dragging a box.
 - Undo (`Ctrl+Z`), then **Save copy** or **Overwrite**.
 
+### Audio
+- **Voice recorder.** Pick a microphone, record, and play it back right in the app.
+- **Live level meter** in dB, with a peak marker and a scrolling waveform.
+- **Download** the recording as a WAV file whenever you want to keep it.
+- **Equalizer APO friendly.** Helpy records through Windows' normal audio path instead of a browser, so any Equalizer APO processing on your microphone is included. Helpy shows a note when it finds Equalizer APO installed.
+
 ### App
 - **Light and dark theme.** Follows your Windows setting automatically, or pick Light or Dark in Settings.
 - **Changelog** in Settings shows what changed in each version.
-- Maximize / restore, minimize to the taskbar, close to the tray, optional launch at Windows startup.
+- Maximize / restore, minimize to the taskbar, close to the tray (right-click the tray icon for **Restart Helpy** or **Quit Helpy**), optional launch at Windows startup.
 - Animated page and tab transitions, hover feedback and a smooth gliding text caret.
 - **Low-end mode** (Settings → Performance) turns off animations, smooth scrolling and blur effects for older PCs.
 
@@ -86,18 +92,19 @@ Delete that folder to reset Helpy completely. Updating or rebuilding the exe nev
 
 ## Updates
 
-Helpy checks GitHub for a newer release when it starts and every few hours while it's running. Most updates are optional: you can update right away or choose **Later**. Occasionally a release is marked **important** (for example an urgent fix), and then you need to update to keep using Helpy. Either way, Helpy downloads the new `Helpy.exe`, replaces itself and restarts. You can also check by hand in Settings → Updates.
+Helpy checks GitHub for a newer release when it starts and again every few hours while it's running. When one is available you're asked to **update now** or exit; Helpy downloads the new `Helpy.exe`, replaces itself and restarts. You can also check by hand in Settings → Updates.
 
 ## Notes
 
-- The X button doesn't quit Helpy, it hides it to the tray so your shortcuts keep working. To fully close it, right-click the tray icon and choose **Quit Helpy**. The minimize button puts it on the taskbar as usual.
+- The X button doesn't quit Helpy, it hides it to the tray so your shortcuts keep working. To fully close it, right-click the tray icon and choose **Quit Helpy** (or **Restart Helpy** to start it fresh). The minimize button puts it on the taskbar as usual.
 - With the default `Win+Shift+S` binding, Helpy takes the shortcut over while it runs, so the Snipping Tool won't open. Quit Helpy and Windows gets it back, or bind a different key in Settings.
 - Digital vibrance is NVIDIA-only. Everything else works on any GPU.
 - A custom mode only works if your driver and monitor accept it.
+- Recording needs Windows to allow desktop apps to use the microphone (Settings → Privacy & security → Microphone). Equalizer APO only affects a microphone you've enabled it for in its Configurator.
 
 ## Tech
 
-Python · pywebview (WebView2) · ctypes / Win32 display and gamma APIs · NVAPI · Pillow · NumPy · dxcam · pystray · PyInstaller
+Python · pywebview (WebView2) · ctypes / Win32 display and gamma APIs · NVAPI · Pillow · NumPy · dxcam · sounddevice (PortAudio) · pystray · PyInstaller
 
 ---
 

@@ -22,7 +22,7 @@ Built with Python, a native Windows API backend and a custom HTML/CSS/JS interfa
 
 ### Screenshots
 - **Region screenshot** (default `Win+Shift+S`) and **full-screen screenshot** hotkeys, both rebindable in Settings. They work from the tray and keep working in Full view.
-- **Fullscreen-game friendly.** In a fullscreen app, the region shortcut takes an instant full-screen shot instead of an overlay that would kick the game out of fullscreen.
+- **Fullscreen-game friendly.** In a game running in *exclusive* fullscreen, the region shortcut takes an instant full-screen shot instead of an overlay that would kick the game out of fullscreen. Borderless and windowed-fullscreen games get the normal region selection.
 - Every shot is saved to your folder and copied to the clipboard.
 - Optional popup notification that fades and slides in and out, plus a camera sound (bring your own sound file, set the volume, or silence it in games).
 - **Gallery** with thumbnails, a "new" badge for shots you haven't opened yet, copy, show in folder and delete.
@@ -44,7 +44,7 @@ Built with Python, a native Windows API backend and a custom HTML/CSS/JS interfa
 - **Voice recorder.** Pick a microphone, record, and play it back right in the app.
 - **Live level meter** in dB, with a peak marker and a scrolling waveform.
 - **Download** the recording as a WAV file whenever you want to keep it.
-- **Equalizer APO friendly.** Helpy records through Windows' normal audio path instead of a browser, so any Equalizer APO processing on your microphone is included. Helpy shows a note when it finds Equalizer APO installed.
+- **Equalizer APO friendly.** Helpy records through Windows' normal audio path instead of a browser, so any Equalizer APO processing on your microphone is included.
 
 ### App
 - **Light and dark theme.** Follows your Windows setting automatically, or pick Light or Dark in Settings.

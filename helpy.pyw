@@ -508,6 +508,18 @@ user32.MonitorFromWindow.restype = ctypes.c_void_p
 user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
 
 
+def is_exclusive_fullscreen():
+    """True only for a real exclusive-mode (Direct3D) fullscreen app. Borderless / windowed-fullscreen games
+    don't count: a selection overlay doesn't disturb those."""
+    try:
+        st = ctypes.c_int(0)
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(st)) == 0:
+            return st.value == 3  # QUNS_RUNNING_D3D_FULL_SCREEN
+    except Exception:
+        pass
+    return False
+
+
 def foreground_fullscreen():
     """Monitor rect if the focused window is a fullscreen app (game, F11 video), else None."""
     hw = user32.GetForegroundWindow()
@@ -898,8 +910,9 @@ def take(kind):
         cfg = load_settings()
         in_fs = foreground_fullscreen()  # a popup window would pull a fullscreen game back to the desktop
         fs = in_fs if cfg.get("game_mode", True) else None
+        excl = bool(cfg.get("game_mode", True)) and is_exclusive_fullscreen()  # only these can't take an overlay
         vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
-        if kind == "region" and not fs:
+        if kind == "region" and not excl:
             img = ImageGrab.grab(all_screens=True)
             tmp = os.path.join(tempfile.gettempdir(), "helpy_snip_full.png")
             out = os.path.join(tempfile.gettempdir(), "helpy_snip_result.txt")
@@ -914,8 +927,8 @@ def take(kind):
                 return  # cancelled
             shot = img.crop((x, y, x + w, y + h))
         else:
-            # full-screen capture, and "region" while a fullscreen app has focus: no overlay window,
-            # so the game never loses focus
+            # full-screen capture, and "region" while an exclusive-fullscreen game has focus: no overlay
+            # window, so the game never loses focus
             rect = fs or monitor_rect()
             shot = grab_dx(rect)
             if shot is None:
@@ -925,6 +938,7 @@ def take(kind):
         copy_to_clipboard(shot)
         add_unseen(path)
         update_badge()
+        in_fs = bool(in_fs) or excl  # exclusive fullscreen counts as fullscreen even if the window check missed it
         loud = (cfg.get("sound", True) and not (in_fs and cfg.get("quiet_fullscreen"))
                 and (in_fs or not cfg.get("sound_fs_only")))
         if loud:
@@ -1264,7 +1278,7 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.3.0"          # bump this before every release build, and tag the release the same (v1.0.1)
+APP_VERSION = "1.3.1"          # bump this before every release build, and tag the release the same (v1.0.1)
 UPDATE_REPO = "ahhmilo/Helpy"
 UPD = {"info": None, "busy": False}
 
@@ -1483,24 +1497,6 @@ def _db(v):
     return -90.0 if v <= 3e-5 else max(-90.0, 20 * math.log10(v))
 
 
-def apo_info():
-    """Is Equalizer APO installed?"""
-    try:
-        import winreg
-    except Exception:
-        return {"found": False, "path": ""}
-    for flag in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
-        try:
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\EqualizerAPO", 0, winreg.KEY_READ | flag) as k:
-                return {"found": True, "path": str(winreg.QueryValueEx(k, "InstallPath")[0])}
-        except OSError:
-            continue
-    for p in (r"C:\Program Files\EqualizerAPO", r"C:\Program Files (x86)\EqualizerAPO"):
-        if os.path.isdir(p):
-            return {"found": True, "path": p}
-    return {"found": False, "path": ""}
-
-
 def audio_devices():
     try:
         import sounddevice as sd
@@ -1527,7 +1523,7 @@ def audio_devices():
         default = apis[wasapi]["default_input_device"] if wasapi is not None else sd.default.device[0]
         if not out:
             return {"ok": False, "msg": "No microphone found. Plug one in and come back to this tab."}
-        return {"ok": True, "devices": out, "default": default, "apo": apo_info()}
+        return {"ok": True, "devices": out, "default": default}
     except Exception as e:
         return {"ok": False, "msg": f"Couldn't list microphones: {e}"}
 
@@ -2012,7 +2008,7 @@ header{display:flex;align-items:center;height:48px;flex:none;padding-right:10px}
 .wb{width:42px;height:30px;margin-left:2px;background:none;border-radius:8px;color:var(--mu);display:grid;place-items:center;transition:background .2s,color .2s}
 .wb:hover{background:var(--card);color:var(--tx)}.wb.close:hover{background:var(--bad);color:#fff}
 
-main,aside{overflow-y:auto;overscroll-behavior:contain;padding:4px 28px 32px}
+main,aside{overflow-y:auto;overscroll-behavior:contain;padding:18px 28px 32px}
 aside{padding-left:4px;padding-right:24px}
 ::-webkit-scrollbar{width:16px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--card2);border-radius:99px;border:5px solid transparent;background-clip:padding-box;min-height:48px}::-webkit-scrollbar-thumb:hover{background:var(--mu);background-clip:padding-box}
 .seg{position:relative;display:none;grid-auto-flow:column;grid-auto-columns:1fr;background:var(--card);border-radius:11px;padding:3px;margin-bottom:16px}
@@ -2279,8 +2275,6 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
 .recbtn .rd{display:block;width:12px;height:12px;border-radius:50%;background:#fff;transition:border-radius .25s,background .25s}
 .recbtn.on{background:var(--card2);color:var(--tx)}.recbtn.on:hover{background:var(--hv)}.recbtn.on .rd{border-radius:3px;background:#ff453a}
 #ares{animation:fade .35s var(--ease)}
-.apo{display:flex;gap:12px;align-items:flex-start}.apo i{flex:none;width:10px;height:10px;border-radius:50%;background:var(--ok);margin-top:5px}
-.apo b{display:block;margin-bottom:3px}.apo span{color:var(--mu);font-size:13px;line-height:1.5}
 </style></head><body>
 <div id="app">
  <header>
@@ -2371,7 +2365,6 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
      <div class="note" id="ainfo" style="margin:10px 0 14px"></div>
      <div style="display:flex;gap:10px"><button class="btn" onclick="aSave()">Download</button><button class="btn sec" onclick="aDiscard()">Discard</button></div>
     </div>
-    <div class="aucard apo" id="aapo" style="display:none"><i></i><div><b>Equalizer APO detected</b><span>Helpy records through Windows' normal audio path, not through a browser, so whatever Equalizer APO applies to this microphone is included in your recording.</span></div></div>
    </div>
   </main>
  </div>
@@ -2380,8 +2373,8 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
    <div class="gt" style="margin:4px 0 18px">Settings</div>
    <div class="grp" style="max-width:640px">
     <div class="sl"><div><span>Launch Helpy when Windows starts (minimized to tray)</span><label class="sw"><input type="checkbox" id="s_start" onchange="saveSet()"><i></i></label></div><p class="note" id="s_startnote" style="margin:8px 0 0"></p></div>
-    <div class="sl"><div><span>Fullscreen apps: capture instantly</span><label class="sw"><input type="checkbox" id="s_game" onchange="saveSet()"><i></i></label></div>
-     <p class="note" style="margin:8px 0 0">When a game or other fullscreen app has focus, the region shortcut takes an instant full-screen shot instead of opening the selection overlay, because an overlay would kick the game out of fullscreen. For the same reason there is no popup in fullscreen apps. The shot is still copied and saved, and the sound plays unless you silence it under Sound.</p></div>
+    <div class="sl"><div><span>Exclusive fullscreen: capture instantly</span><label class="sw"><input type="checkbox" id="s_game" onchange="saveSet()"><i></i></label></div>
+     <p class="note" style="margin:8px 0 0">When a game in exclusive fullscreen has focus, the region shortcut takes an instant full-screen shot instead of opening the selection overlay, because an overlay would kick the game out of fullscreen. Borderless and windowed-fullscreen games get the normal selection overlay. There is no popup while a fullscreen app has focus. The shot is still copied and saved, and the sound plays unless you silence it under Sound.</p></div>
     <div class="sl"><div><span>Show a notification after each screenshot</span><label class="sw"><input type="checkbox" id="s_notify" onchange="saveSet()"><i></i></label></div></div>
    </div>
    <h3 style="margin-top:22px">Sound</h3>
@@ -2673,13 +2666,13 @@ document.addEventListener('keydown',e=>{
  if(!GALL.sel||LB>=0||ED||CAPK||$('upd').classList.contains('show'))return;
  if(e.key=='Escape')setSel(false);
  else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()=='a'&&!(e.target&&e.target.tagName=='INPUT')){e.preventDefault();selAll()}});
-async function openLB(i,dir){
+async function openLB(i,dir,del){
  if(LBA)setActual(false);LB=i;const x=G.items[i];
  if(x.new){x.new=false;const t=document.querySelector(`.tile[data-i="${i}"]`);if(t)t.classList.remove('new');api().mark_seen(x.path).then(setBadge)}$('lbn').textContent=x.name;$('lb').classList.add('show');syncModal();lbNavUi();zoomReset(true);
  $('lbdel').textContent='Delete';clearTimeout(DELT);DELT=null;
  const im=$('lbi'),pr=api().full(x.path);
  if(dir&&!LITE&&im.src&&im.complete){
-  const out=im.animate([{opacity:1,transform:'translateX(0)'},{opacity:0,transform:`translateX(${-dir*56}px) scale(.98)`}],{duration:150,easing:'ease-in',fill:'forwards'});
+  const out=del?im.animate([{opacity:1,transform:'none'},{opacity:0,transform:'translateY(22px) scale(.86)'}],{duration:190,easing:'ease-in',fill:'forwards'}):im.animate([{opacity:1,transform:'translateX(0)'},{opacity:0,transform:`translateX(${-dir*56}px) scale(.98)`}],{duration:150,easing:'ease-in',fill:'forwards'});
   const [src]=await Promise.all([pr,out.finished.catch(()=>0)]);
   if(LB!=i){out.cancel();return}
   im.src=src;try{await im.decode()}catch(e){}
@@ -2697,7 +2690,7 @@ async function lbDel(){
  clearTimeout(DELT);DELT=null;b.textContent='Delete';
  const rm=G.items[LB];setBadge(await api().delete_shot(rm.path));G.all=G.all.filter(x=>x!==rm);
  const keep=LB;applyView();
- if(!G.items.length)closeLB();else openLB(Math.min(keep,G.items.length-1));toast('Moved to Recycle Bin')}
+ if(!G.items.length)closeLB();else{const ni=Math.min(keep,G.items.length-1);openLB(ni,ni===keep?1:-1,true)}toast('Moved to Recycle Bin')}
 async function openShot(path){
  if(ED)edCancel(true);
  page(1);GALL.q='';$('gq').value='';$('gsearch').classList.remove('has');await galleryRefresh();
@@ -3120,12 +3113,12 @@ async function aInit(){
  if(!AU.dd)AU.dd=mkDD($('adev'),it=>{AU.dev=AU.devs.find(d=>d.id===it.id);ST.audio_device=AU.dev.name;api().set_settings(ST).then(r=>{ST=r});aFillDev()});
  const r=await api().audio_devices();
  AU.ready=true;
- if(!r.ok){AU.devs=[];AU.dev=null;$('amsg').textContent=r.msg;$('arec').disabled=true;$('adev').querySelector('span').textContent='No microphone';$('aapo').style.display='none';return}
+ if(!r.ok){AU.devs=[];AU.dev=null;$('amsg').textContent=r.msg;$('arec').disabled=true;$('adev').querySelector('span').textContent='No microphone';return}
  $('arec').disabled=false;$('amsg').textContent='';
  AU.devs=r.devices;
  const keep=AU.dev&&AU.devs.find(d=>d.name===AU.dev.name),saved=AU.devs.find(d=>d.name===ST.audio_device);
  AU.dev=keep||saved||AU.devs.find(d=>d.id===r.default)||AU.devs[0];
- aFillDev();$('aapo').style.display=r.apo&&r.apo.found?'':'none';aDraw()}
+ aFillDev();aDraw()}
 function aFillDev(){AU.dd.fill(AU.devs.map(d=>({id:d.id,label:d.name})),AU.dev?AU.dev.id:null)}
 async function aToggle(){
  if(AU.rec)return aStop();

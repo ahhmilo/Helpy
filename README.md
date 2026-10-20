@@ -1,6 +1,6 @@
-# Helpy
-
 <img src="assets/helpy-icon.png" width="96" alt="Helpy logo">
+
+# Helpy
 
 A Windows utility for display controls, screenshots, audio recording, and local text files. Built with Python, native Windows APIs, and an HTML/CSS/JavaScript interface in pywebview.
 

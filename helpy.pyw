@@ -1,5 +1,5 @@
 """
-Helpy - resolution + refresh rate switcher for Windows (pywebview UI).
+Helpy - display controls, screenshots, and audio tools for Windows (pywebview UI).
 
   pip install pywebview pystray pillow   (tkinter ships with Python)
   python helpy.pyw
@@ -7,6 +7,12 @@ Helpy - resolution + refresh rate switcher for Windows (pywebview UI).
 """
 import argparse, ctypes, json, os, sys
 from ctypes import wintypes
+from helpy_files import DocumentStore, OpenRequests, TEXT_EXTENSIONS, IMAGE_EXTENSIONS, context_menu, revision, read_bytes
+
+
+def resource_path(*parts):
+    """Resolve assets in source runs and PyInstaller's extracted bundle."""
+    return os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), *parts)
 
 # ---------------------------------------------------------------- Win32 layer
 user32 = ctypes.windll.user32
@@ -122,6 +128,8 @@ def change_mode(dev, w, h, hz, test_only=False):
 
 # ------------------------------------------------------------------ presets
 PRESET_FILE = os.path.join(os.environ.get("APPDATA", "."), "Helpy", "presets.json")
+FILES = DocumentStore()
+OPEN_REQUESTS = OpenRequests(os.path.dirname(PRESET_FILE))
 _OLD = os.path.join(os.environ.get("APPDATA", "."), "DisplayPanel")
 if os.path.isdir(_OLD) and not os.path.exists(os.path.dirname(PRESET_FILE)):  # keep presets from before the rename
     import shutil
@@ -331,6 +339,14 @@ DEF_SETTINGS = {
     "game_mode": True,
     "notify": True,
     "lite": False,
+    "animations": True,
+    "smooth_scroll": True,
+    "smooth_caret": True,
+    "blur": True,
+    "shadows": True,
+    "cursor_blink": True,
+    "cursor_style": "line",
+    "syntax": True,
     "theme": "auto",
     "audio_device": "",
     "gallery_sort": "new",
@@ -355,11 +371,16 @@ NOWIN = 0x08000000  # CREATE_NO_WINDOW
 
 def load_settings():
     s = json.loads(json.dumps(DEF_SETTINGS))
+    stored = {}
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
-            s.update(json.load(f))
+            stored = json.load(f)
+            s.update(stored)
     except Exception:
         pass
+    for key in ("animations", "smooth_scroll", "smooth_caret", "blur", "shadows"):
+        if key not in stored:
+            s[key] = not bool(stored.get("lite", False))
     return s
 
 
@@ -384,6 +405,8 @@ def clean_bind(b):
 def _safe(path):
     folder = os.path.realpath(load_settings()["folder"])
     p = os.path.realpath(path)
+    if FILES.image_allowed(p):
+        return p
     if os.path.commonpath([folder, p]) != folder:
         raise ValueError("Path is outside the screenshots folder")
     return p
@@ -628,13 +651,10 @@ def remove_unseen(path=None):
 
 def tray_image(n=0):
     from PIL import Image, ImageDraw
-    blue, dark = (10, 132, 255, 255), (28, 28, 30, 255)
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    dark = (28, 28, 30, 255)
+    with Image.open(resource_path("assets", "helpy-icon.png")) as source:
+        img = source.convert("RGBA").resize((64, 64), Image.Resampling.LANCZOS)
     d = ImageDraw.Draw(img)
-    d.rounded_rectangle((4, 8, 60, 44), radius=8, fill=blue)
-    d.rounded_rectangle((9, 13, 55, 39), radius=5, fill=dark)
-    d.rectangle((28, 44, 36, 52), fill=blue)
-    d.rounded_rectangle((18, 52, 46, 58), radius=3, fill=blue)
     if n:  # red dot = something new in the gallery
         d.ellipse((36, 0, 64, 28), fill=(255, 69, 58, 255), outline=dark, width=3)
     return img
@@ -1278,7 +1298,7 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.3.1"          # bump this before every release build, and tag the release the same (v1.0.1)
+APP_VERSION = "1.4.0"          # source version for the next user-published release
 UPDATE_REPO = "ahhmilo/Helpy"
 UPD = {"info": None, "busy": False}
 
@@ -1649,7 +1669,9 @@ def _restart_script(pid, args):
             '(goto) 2>nul & del "%~f0"\r\n')
 
 
-def restart_app():
+def restart_app(confirmed=False):
+    if not confirmed:
+        return request_app_exit("restart")
     try:
         exe = os.path.abspath(sys.executable)
         args = [exe] if IS_EXE else [exe, os.path.abspath(sys.argv[0])]
@@ -1661,10 +1683,81 @@ def restart_app():
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         return
-    quit_app()
+    quit_app(confirmed=True)
 
 
 class Api:
+    def file_new(self):
+        return FILES.new()
+
+    def file_close(self, ident):
+        FILES.close(ident)
+        return {"ok": True}
+
+    def file_reload(self, ident):
+        try:
+            return FILES.reload(ident)
+        except (OSError, ValueError, KeyError) as exc:
+            return {"ok": False, "msg": str(exc)}
+
+    def file_poll(self, ids):
+        return {"items": FILES.poll(ids)}
+
+    def file_save(self, ident, text, expected):
+        try:
+            return FILES.save(ident, text, expected)
+        except (OSError, ValueError, KeyError) as exc:
+            return {"ok": False, "msg": str(exc)}
+
+    def file_save_as(self, ident, text, expected):
+        import webview
+        try:
+            item = FILES.sessions[ident]
+            selected = WINDOW.create_file_dialog(webview.FileDialog.SAVE, save_filename=item["name"] if item["path"] else "Untitled.txt",
+                                                  file_types=("Text files (*.txt;*.md;*.py;*.js;*.json)", "All files (*.*)"))
+            if not selected:
+                return {"ok": False, "cancelled": True}
+            path = selected[0] if isinstance(selected, (list, tuple)) else selected
+            # Native Save As confirms replacement; still detect a subsequent change during writing.
+            from helpy_files import canonical
+            disk_revision = expected if canonical(path) == item["path"] else revision(read_bytes(path)) if os.path.exists(path) else None
+            return FILES.save(ident, text, disk_revision, path)
+        except (OSError, ValueError, KeyError) as exc:
+            return {"ok": False, "msg": str(exc)}
+
+    def file_pick(self):
+        import webview
+        patterns = ";".join("*" + ext for ext in sorted(TEXT_EXTENSIONS | IMAGE_EXTENSIONS))
+        paths = WINDOW.create_file_dialog(webview.FileDialog.OPEN, allow_multiple=True, file_types=(f"Supported files ({patterns})",))
+        return {"items": open_file_items(paths or [])}
+
+    def file_requests(self):
+        return {"items": open_file_items(OPEN_REQUESTS.drain())}
+
+    def file_context_menu(self, enabled=None):
+        try:
+            # Use a persistent icon in AppData; PyInstaller's extraction folder disappears on exit.
+            icon = os.path.join(os.path.dirname(PRESET_FILE), "helpy.ico")
+            if enabled:
+                import shutil
+                os.makedirs(os.path.dirname(icon), exist_ok=True)
+                shutil.copyfile(resource_path("assets", "helpy.ico"), icon)
+            command = self_cmd()
+            if not IS_EXE:
+                pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+                if os.path.exists(pythonw):
+                    command[0] = pythonw
+            return context_menu(enabled, command, icon)
+        except OSError as exc:
+            return {"ok": False, "msg": str(exc)}
+
+    def file_finish_exit(self, action):
+        if action == "restart":
+            threading.Thread(target=restart_app, kwargs={"confirmed": True}, daemon=True).start()
+        elif action == "quit":
+            quit_app(confirmed=True)
+        return {"ok": True}
+
     def get_settings(self):
         return {**load_settings(), **_startup_info()}
 
@@ -1682,6 +1775,9 @@ class Api:
         cur["game_mode"] = bool(s.get("game_mode", True))
         cur["notify"] = bool(s.get("notify", True))
         cur["lite"] = bool(s.get("lite", False))
+        for key in ("animations", "smooth_scroll", "smooth_caret", "blur", "shadows", "cursor_blink", "syntax"):
+            cur[key] = bool(s.get(key, cur[key]))
+        cur["cursor_style"] = s.get("cursor_style") if s.get("cursor_style") in ("line", "block", "underline") else "line"
         cur["theme"] = s.get("theme") if s.get("theme") in ("auto", "light", "dark") else "auto"
         cur["audio_device"] = str(s.get("audio_device", ""))[:200]
         cur["gallery_sort"] = s.get("gallery_sort") if s.get("gallery_sort") in ("new", "old", "az", "za", "big") else "new"
@@ -1883,6 +1979,8 @@ class Api:
                 out = os.path.join(folder, f"{stem} (edited {n}).{fmt}")
                 n += 1
         save_image(im, out, fmt, q)
+        if FILES.image_allowed(p):
+            FILES.allow_image(out)
         remove_unseen(out)
         return out
 
@@ -1939,6 +2037,8 @@ class Api:
         return r
 
     def start_update(self):
+        if WINDOW.evaluate_js("!!(window.HelpyNotes && HelpyNotes.hasUnsaved())"):
+            return {"ok": False, "msg": "Save or close unsaved text tabs before updating Helpy."}
         info = UPD["info"]
         if not IS_EXE:
             return {"ok": False, "msg": "Auto-update only works in the built Helpy.exe."}
@@ -1994,6 +2094,11 @@ class Api:
 
 
 # ----------------------------------------------------------------------- UI
+def build_html(logo_uri):
+    from helpy_ui import editor_assets
+    return editor_assets(resource_path, HTML.replace("__HELPY_LOGO_URI__", logo_uri))
+
+
 HTML = r"""<!doctype html><html><head><meta charset="utf-8"><style>
 :root{color-scheme:dark light;--bg:#1c1c1e;--card:#2c2c2e;--card2:#3a3a3c;--sep:rgba(255,255,255,.08);--tx:#f5f5f7;--mu:#98989f;--ac:#0a84ff;--ok:#30d158;--bad:#ff453a;--ease:cubic-bezier(.2,.9,.3,1);--spring:cubic-bezier(.3,1.3,.4,1)}
 @media(prefers-color-scheme:light){:root{--bg:#f2f2f7;--card:#fff;--card2:#e9e9ee;--sep:rgba(0,0,0,.08);--tx:#1d1d1f;--mu:#6e6e73;--ac:#007aff;--ok:#34c759;--bad:#ff3b30}}
@@ -2004,7 +2109,7 @@ button,input{font:inherit;color:inherit}button{cursor:pointer;border:0}
 #app{display:flex;flex-direction:column;height:100%}
 header{display:flex;align-items:center;height:48px;flex:none;padding-right:10px}
 #drag{flex:none;padding-right:26px;height:100%;display:flex;align-items:center;gap:10px;padding-left:24px;font-weight:600;font-size:13px;color:var(--mu)}
-#drag i{width:14px;height:10px;border:2px solid var(--ac);border-radius:3px}
+#drag img{width:24px;height:24px;object-fit:contain;flex:none;pointer-events:none}
 .wb{width:42px;height:30px;margin-left:2px;background:none;border-radius:8px;color:var(--mu);display:grid;place-items:center;transition:background .2s,color .2s}
 .wb:hover{background:var(--card);color:var(--tx)}.wb.close:hover{background:var(--bad);color:#fff}
 
@@ -2278,8 +2383,8 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
 </style></head><body>
 <div id="app">
  <header>
-  <div id="drag" class="pywebview-drag-region"><i></i>Helpy</div>
-  <div class="seg" id="nav" style="--n:4;--i:0"><div class="thumb"></div><button class="sg on" onclick="page(0)">Display</button><button class="sg" onclick="page(1)">Screenshots<b class="badge" id="badge"></b></button><button class="sg" onclick="page(2)">Audio<b class="recdot" id="recdot"></b></button><button class="sg" onclick="page(3)">Settings</button></div>
+  <div id="drag" class="pywebview-drag-region"><img src="__HELPY_LOGO_URI__" alt="" draggable="false">Helpy</div>
+  <div class="seg" id="nav" style="--n:5;--i:0"><div class="thumb"></div><button class="sg on" onclick="page(0)">Display</button><button class="sg" onclick="page(1)">Screenshots<b class="badge" id="badge"></b></button><button class="sg" onclick="page(2)">Audio<b class="recdot" id="recdot"></b></button><button class="sg" onclick="page(3)">Notepad</button><button class="sg" onclick="page(4)">Settings</button></div>
   <div class="pywebview-drag-region" style="flex:1;height:100%" ondblclick="maxi()"></div>
   <button class="wb" onclick="mini()" title="Minimize" aria-label="Minimize"><svg width="12" height="12" viewBox="0 0 12 12"><path d="M1 6h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></button>
   <button class="wb" id="wmax" onclick="maxi()" title="Maximize" aria-label="Maximize"><svg id="wmaxi" width="12" height="12" viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg></button>
@@ -2368,6 +2473,13 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
    </div>
   </main>
  </div>
+ <div id="notes" class="page">
+  <div class="note-toolbar"><button class="btn sec" id="note-new">New</button><button class="btn sec" id="note-open">Open…</button><button class="btn" id="note-save">Save</button><button class="btn sec" id="note-saveas">Save as…</button><span class="spacer"></span><label>Language <select id="note-language" aria-label="Syntax language"><option value="auto">Auto</option><option value="text/plain">Plain text</option><option value="text/x-markdown">Markdown</option><option value="text/x-python">Python</option><option value="text/javascript">JavaScript</option><option value="application/typescript">TypeScript</option><option value="application/json">JSON</option><option value="text/html">HTML</option><option value="text/css">CSS</option><option value="application/xml">XML</option><option value="text/x-yaml">YAML</option><option value="text/x-csrc">C</option><option value="text/x-c++src">C++</option><option value="text/x-csharp">C#</option><option value="text/x-java">Java</option><option value="text/x-sh">Shell</option><option value="application/x-powershell">PowerShell</option><option value="text/x-sql">SQL</option><option value="text/x-rustsrc">Rust</option><option value="text/x-go">Go</option></select></label><button class="btn sec" id="note-preview-toggle">Markdown preview</button></div>
+  <div class="note-tabs" id="note-tabs" role="tablist" aria-label="Open documents"></div>
+  <div class="note-conflict" id="note-conflict" role="status" hidden><span id="note-conflict-message"></span><button class="btn sec" id="note-reload">Reload disk version</button><button class="btn sec" id="note-copy">Save a copy</button><button class="btn sec" id="note-overwrite">Overwrite disk version</button></div>
+  <div class="note-workspace"><div id="note-editor"></div><article id="note-preview" hidden></article><div id="note-empty"><b>A place for your files</b><span>Open text, Markdown or code. Keep each file in its own tab.</span><span>Ctrl+O to open · Ctrl+N for a new note</span></div></div>
+  <div class="note-status"><span class="note-path" id="note-path"></span><span id="note-position"></span></div>
+ </div>
  <div id="setp" class="page" style="grid-template-columns:1fr">
   <main>
    <div class="gt" style="margin:4px 0 18px">Settings</div>
@@ -2391,7 +2503,19 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
    </div>
    <h3 style="margin-top:22px">Performance</h3>
    <div class="grp" style="max-width:640px">
-    <div class="sl"><div><span>Low-end mode</span><label class="sw"><input type="checkbox" id="s_lite" onchange="saveSet()"><i></i></label></div><p class="note" style="margin:8px 0 0">Turns off animations, transitions, smooth scrolling and blur effects. Helps on older or slower PCs.</p></div>
+    <div class="sl"><div><span>Low-end preset</span><button class="mod" onclick="lowEndPreset()">Turn off visual effects</button></div><p class="note" style="margin:8px 0 0">Each effect can also be controlled individually below.</p></div>
+    <div class="sl"><div><span>Interface animations</span><label class="sw"><input type="checkbox" id="s_animations" onchange="saveEffects()"><i></i></label></div></div>
+    <div class="sl"><div><span>Smooth scrolling</span><label class="sw"><input type="checkbox" id="s_smooth_scroll" onchange="saveEffects()"><i></i></label></div></div>
+    <div class="sl"><div><span>Smooth text cursor movement</span><label class="sw"><input type="checkbox" id="s_smooth_caret" onchange="saveEffects()"><i></i></label></div></div>
+    <div class="sl"><div><span>Background blur</span><label class="sw"><input type="checkbox" id="s_blur" onchange="saveEffects()"><i></i></label></div></div>
+    <div class="sl"><div><span>Shadows</span><label class="sw"><input type="checkbox" id="s_shadows" onchange="saveEffects()"><i></i></label></div></div>
+   </div>
+   <h3 style="margin-top:22px">Notepad</h3>
+   <div class="grp" style="max-width:640px">
+    <div class="sl"><div><span>Syntax highlighting</span><label class="sw"><input type="checkbox" id="s_syntax" onchange="saveEffects()"><i></i></label></div></div>
+    <div class="sl"><div><span>Cursor blinking</span><label class="sw"><input type="checkbox" id="s_cursor_blink" onchange="saveEffects()"><i></i></label></div></div>
+    <div class="sl file-setting"><div><span>Editor cursor style</span><select id="s_cursor_style" onchange="saveEffects()"><option value="line">Line</option><option value="block">Block</option><option value="underline">Underline</option></select></div></div>
+    <div class="sl"><div><span>“Open with Helpy” in File Explorer</span><label class="sw"><input type="checkbox" id="s_file_menu" onchange="setFileMenu(this)"><i></i></label></div><p class="note" style="margin:8px 0 0">Adds a menu item for supported files without changing default apps. On Windows 11 it may appear under “Show more options”. Re-enable it if you move Helpy.</p></div>
    </div>
    <h3 style="margin-top:22px">Updates</h3>
    <div class="grp" style="max-width:640px">
@@ -2405,6 +2529,7 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
  </div>
 </div>
 <div id="toast"></div>
+<dialog class="note-dialog" id="note-dialog" aria-labelledby="note-dialog-title"><h3 id="note-dialog-title"></h3><p id="note-dialog-message"></p><div class="actions" id="note-dialog-actions"></div></dialog>
 <div id="upd"><div class="ubox">
  <div class="ut" id="ut">Update available</div><div class="uv" id="uv"></div>
  <div class="uw" id="uw" style="display:none">This is an important update. Update now to keep using Helpy, or exit.</div>
@@ -2555,7 +2680,7 @@ function smooth(el){
  const edge=e=>{if(el.scrollHeight<=el.clientHeight+1)return true;const cur=raf?t:el.scrollTop;
   return (e.deltaY<0&&cur<=0)||(e.deltaY>0&&cur>=el.scrollHeight-el.clientHeight-1)};
  const step=()=>{const d=t-el.scrollTop;if(Math.abs(d)<1||++n>140){el.scrollTop=t;raf=0;n=0;return}let s=d*.14;if(Math.abs(s)<1)s=Math.sign(d);el.scrollTop+=s;raf=requestAnimationFrame(step)};
- el.addEventListener('wheel',e=>{if(e.ctrlKey)return;cancelAnimationFrame(el._an||0);if(LITE||innerScroll(e,el)||(el.id=='clog'||el.id=='un')&&edge(e))return;e.preventDefault();if(!raf)t=el.scrollTop;
+ el.addEventListener('wheel',e=>{if(e.ctrlKey)return;cancelAnimationFrame(el._an||0);if(ST?.smooth_scroll===false||innerScroll(e,el)||(el.id=='clog'||el.id=='un')&&edge(e))return;e.preventDefault();if(!raf)t=el.scrollTop;
   t=Math.max(0,Math.min(el.scrollHeight-el.clientHeight,t+e.deltaY*(e.deltaMode==1?40:1)));if(!raf)raf=requestAnimationFrame(step)},{passive:false})}
 document.querySelectorAll('main,aside,#clog,#un').forEach(smooth);
 let ST=null,G={items:[],folder:''},LB=-1,IO=null,CAPK=null,DELT=null;
@@ -2576,7 +2701,7 @@ function page(i){
  if(LB>=0||ED)return;
  const from=PG;PG=i;
  $('nav').style.setProperty('--i',i);document.querySelectorAll('#nav .sg').forEach((b,j)=>b.classList.toggle('on',j==i));
- swapTo([$('body'),$('shots'),$('audio'),$('setp')],from,i,'p');if(i==1)galleryRefresh();if(i==2)aInit()}
+ swapTo([$('body'),$('shots'),$('audio'),$('notes'),$('setp')],from,i,'p');if(i==1)galleryRefresh();if(i==2)aInit();if(i==3)setTimeout(()=>window.HelpyNotes?.refresh(),170)}
 function renderKeys(){
  const names={region:'Region screenshot',full:'Full screen screenshot'};
  for(const k of ['region','full']){const b=ST[k];
@@ -2587,9 +2712,9 @@ function renderKeys(){
 async function saveST(){ST.enabled=$('sen').checked;ST=await api().set_settings(ST);renderKeys()}
 function mod(k,m){ST[k][m]=!ST[k][m];saveST()}
 function capKey(k){CAPK=k;const b=document.querySelector(`#krow_${k} .key`);b.textContent='Press a key…';b.classList.add('cap')}
-function renderSet(){renderSnd();applyTheme();renderFmt();$('s_lite').checked=!!ST.lite;applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
+function renderSet(){renderSnd();applyTheme();renderFmt();renderEffects();applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
 async function saveSet(){
- ST.lite=$('s_lite').checked;ST.game_mode=$('s_game').checked;ST.notify=$('s_notify').checked;ST.sound=$('s_snd').checked;ST.volume=+$('s_vol').value;ST.quiet_fullscreen=$('s_quiet').checked;ST.sound_fs_only=$('s_fsonly').checked;
+ ST.game_mode=$('s_game').checked;ST.notify=$('s_notify').checked;ST.sound=$('s_snd').checked;ST.volume=+$('s_vol').value;ST.quiet_fullscreen=$('s_quiet').checked;ST.sound_fs_only=$('s_fsonly').checked;
  await api().set_startup($('s_start').checked);ST=await api().set_settings(ST);renderKeys()}
 let LBF=false,LBA=false,UIT=null;
 function lbUi(){const l=$('lb');l.classList.add('ui');clearTimeout(UIT);if(LBF)UIT=setTimeout(()=>l.classList.remove('ui'),2500)}
@@ -2663,14 +2788,17 @@ function setQuery(v){GALL.q=v;$('gsearch').classList.toggle('has',!!v);clearTime
 function clearQuery(){$('gq').value='';setQuery('');$('gq').focus()}
 function setSort(v){GALL.sort=v;ST.gallery_sort=v;ddRender();applyView();api().set_settings(ST).then(r=>{ST=r})}
 document.addEventListener('keydown',e=>{
- if(!GALL.sel||LB>=0||ED||CAPK||$('upd').classList.contains('show'))return;
+ if(PG!==1||!GALL.sel||LB>=0||ED||CAPK||$('upd').classList.contains('show'))return;
  if(e.key=='Escape')setSel(false);
  else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()=='a'&&!(e.target&&e.target.tagName=='INPUT')){e.preventDefault();selAll()}});
+let EXTERNAL_IMAGE=null;
+const lbItem=()=>EXTERNAL_IMAGE||G.items[LB];
+async function openExternalImage(item){EXTERNAL_IMAGE=item;await openLB(0)}
 async function openLB(i,dir,del){
- if(LBA)setActual(false);LB=i;const x=G.items[i];
+ if(LBA)setActual(false);LB=i;const x=lbItem();
  if(x.new){x.new=false;const t=document.querySelector(`.tile[data-i="${i}"]`);if(t)t.classList.remove('new');api().mark_seen(x.path).then(setBadge)}$('lbn').textContent=x.name;$('lb').classList.add('show');syncModal();lbNavUi();zoomReset(true);
  $('lbdel').textContent='Delete';clearTimeout(DELT);DELT=null;
- const im=$('lbi'),pr=api().full(x.path);
+ const im=$('lbi'),pr=api().full(x.path).catch(err=>{if(lbItem()?.path===x.path){closeLB();toast('Could not open image: '+err,true)}return ''});
  if(dir&&!LITE&&im.src&&im.complete){
   const out=del?im.animate([{opacity:1,transform:'none'},{opacity:0,transform:'translateY(22px) scale(.86)'}],{duration:190,easing:'ease-in',fill:'forwards'}):im.animate([{opacity:1,transform:'translateX(0)'},{opacity:0,transform:`translateX(${-dir*56}px) scale(.98)`}],{duration:150,easing:'ease-in',fill:'forwards'});
   const [src]=await Promise.all([pr,out.finished.catch(()=>0)]);
@@ -2680,19 +2808,20 @@ async function openLB(i,dir,del){
   out.cancel();
   im.animate([{opacity:0,transform:`translateX(${dir*56}px) scale(.98)`},{opacity:1,transform:'translateX(0) scale(1)'}],{duration:380,easing:'cubic-bezier(.2,.8,.2,1)'});
  }else{const src=await pr;if(LB==i)im.src=src}}
-function closeLB(){if(LBF)lbFull();setActual(false);zoomReset(true);LB=-1;syncModal();$('lb').classList.remove('show')}
-function lbGo(d){if(LB<0)return;const n=LB+d;if(n>=0&&n<G.items.length)openLB(n,d)}
-async function lbCopy(){await api().copy_image(G.items[LB].path);toast('Copied to clipboard')}
-function lbShow(){api().reveal(G.items[LB].path)}
+function closeLB(){if(LBF)lbFull();setActual(false);zoomReset(true);LB=-1;EXTERNAL_IMAGE=null;syncModal();$('lb').classList.remove('show')}
+function lbGo(d){if(LB<0||EXTERNAL_IMAGE)return;const n=LB+d;if(n>=0&&n<G.items.length)openLB(n,d)}
+async function lbCopy(){await api().copy_image(lbItem().path);toast('Copied to clipboard')}
+function lbShow(){api().reveal(lbItem().path)}
 async function lbDel(){
  const b=$('lbdel');
  if(!DELT){b.textContent='Click again to delete';DELT=setTimeout(()=>{DELT=null;b.textContent='Delete'},3000);return}
  clearTimeout(DELT);DELT=null;b.textContent='Delete';
- const rm=G.items[LB];setBadge(await api().delete_shot(rm.path));G.all=G.all.filter(x=>x!==rm);
+ const rm=lbItem();setBadge(await api().delete_shot(rm.path));if(EXTERNAL_IMAGE){closeLB();toast('Moved to Recycle Bin');return}G.all=G.all.filter(x=>x!==rm);
  const keep=LB;applyView();
  if(!G.items.length)closeLB();else{const ni=Math.min(keep,G.items.length-1);openLB(ni,ni===keep?1:-1,true)}toast('Moved to Recycle Bin')}
 async function openShot(path){
- if(ED)edCancel(true);
+ if(ED){toast('Finish or cancel the current image edits before opening another screenshot.');return}
+ if(LB>=0)closeLB();
  page(1);GALL.q='';$('gq').value='';$('gsearch').classList.remove('has');await galleryRefresh();
  const i=G.items.findIndex(x=>x.path.toLowerCase()==path.toLowerCase());if(i>=0)openLB(i)}
 document.addEventListener('keydown',e=>{
@@ -2700,6 +2829,7 @@ document.addEventListener('keydown',e=>{
 document.addEventListener('keydown',e=>{if(!open())return;if(e.key=='Enter')keep();if(e.key=='Escape')undo()});
 $('q').oninput=renderList;
 window.addEventListener('pywebviewready',async()=>{ST=await api().get_settings();applyLite();applyTheme();GALL.sort=ST.gallery_sort||'new';ddRender();renderKeys();refresh(true);api().unseen_count().then(setBadge);
+ HelpyNotes.init();api().file_context_menu().then(r=>{$('s_file_menu').checked=!!r.enabled});
  api().app_info().then(i=>{$('s_ver').textContent='v'+i.version;renderSet();
   setTimeout(()=>checkUpd(false),3000);setInterval(()=>{if(!$('upd').classList.contains('show'))checkUpd(false)},6*3600*1000)})});
 
@@ -2723,7 +2853,7 @@ function edSync(){const o=$('edov');o.width=ED.cv.width;o.height=ED.cv.height;o.
 function edOvClear(){const o=$('edov');o.getContext('2d').clearRect(0,0,o.width,o.height);o.style.opacity=1}
 function lbEdit(){
  if(LB<0)return;if(LBF)lbFull();setActual(false);
- const x=G.items[LB],src=$('lbi').src;if(!src)return;
+ const x=lbItem(),src=$('lbi').src;if(!src)return;
  const im=new Image();
  im.onload=()=>{
   const cv=$('edcv');cv.width=im.naturalWidth;cv.height=im.naturalHeight;
@@ -2856,8 +2986,8 @@ async function edSave(over){
  try{
   const out=await api().save_edit(path,ED.cv.toDataURL('image/png'),!!over);
   ED=null;$('ed').classList.remove('show');$('edcur').style.display='none';
-  await galleryRefresh();const i=G.items.findIndex(x=>x.path.toLowerCase()==out.toLowerCase());
-  if(i>=0)openLB(i);toast(over?'Saved over the original':'Saved a copy')
+  if(EXTERNAL_IMAGE){await openExternalImage({path:out,name:out.split(/[\\/]/).pop()})}
+  else{await galleryRefresh();const i=G.items.findIndex(x=>x.path.toLowerCase()==out.toLowerCase());if(i>=0)openLB(i)}toast(over?'Saved over the original':'Saved a copy')
  }catch(err){toast('Could not save: '+err,true)}}
 document.addEventListener('keydown',e=>{
  if(!ED)return;
@@ -2873,13 +3003,21 @@ document.addEventListener('keydown',e=>{
 
 /* ---- low-end mode ---- */
 var LITE=false;
-function applyLite(){LITE=!!(ST&&ST.lite);document.body.classList.toggle('lite',LITE)}
+function applyLite(){
+ LITE=ST?.animations===false;document.body.classList.remove('lite');
+ for(const [key,cls] of [['animations','no-animations'],['smooth_scroll','no-smooth-scroll'],['smooth_caret','no-caret-motion'],['blur','no-blur'],['shadows','no-shadows'],['cursor_blink','no-caret-blink']])document.body.classList.toggle(cls,ST?.[key]===false);
+ document.body.dataset.cursor=ST?.cursor_style||'line';window.HelpyNotes?.preferences();document.dispatchEvent(new Event('selectionchange'))}
+const EFFECT_KEYS=['animations','smooth_scroll','smooth_caret','blur','shadows','syntax','cursor_blink'];
+function renderEffects(){for(const key of EFFECT_KEYS)$('s_'+key).checked=ST[key]!==false;$('s_cursor_style').value=ST.cursor_style||'line'}
+async function saveEffects(){for(const key of EFFECT_KEYS)ST[key]=$('s_'+key).checked;ST.cursor_style=$('s_cursor_style').value;ST.lite=false;applyLite();ST=await api().set_settings(ST);renderEffects()}
+function lowEndPreset(){for(const key of ['animations','smooth_scroll','smooth_caret','blur','shadows'])$('s_'+key).checked=false;saveEffects()}
+async function setFileMenu(el){el.disabled=true;try{const r=await api().file_context_menu(el.checked);if(r.ok===false)throw Error(r.msg);el.checked=!!r.enabled;toast(r.enabled?'Explorer menu enabled':'Explorer menu removed')}catch(e){el.checked=!el.checked;toast(String(e),true)}finally{el.disabled=false}}
 function syncModal(){document.body.classList.toggle('modal',LB>=0||!!ED)}
-function lbNavUi(){document.querySelector('.nv.l').disabled=LB<=0;document.querySelector('.nv.r').disabled=LB>=G.items.length-1}
+function lbNavUi(){document.querySelector('.nv.l').disabled=!!EXTERNAL_IMAGE||LB<=0;document.querySelector('.nv.r').disabled=!!EXTERNAL_IMAGE||LB>=G.items.length-1}
 /* ---- animated scroll (back-to-top) ---- */
 function animScroll(el,to,dur){
  cancelAnimationFrame(el._an||0);const from=el.scrollTop,d=to-from;if(!d)return;
- if(LITE){el.scrollTop=to;return}
+ if(ST?.smooth_scroll===false){el.scrollTop=to;return}
  dur=dur||Math.min(900,380+Math.abs(d)*.22);
  const t0=performance.now(),ease=t=>t<.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
  const step=now=>{const p=Math.min(1,(now-t0)/dur);el.scrollTop=from+d*ease(p);if(p<1)el._an=requestAnimationFrame(step)};
@@ -2971,9 +3109,9 @@ async function checkUpd(manual){
  const ok=t=>t&&t.tagName=='INPUT'&&/^(text|search|)$/.test(t.type||'')&&t.selectionStart!=null;
  const hide=()=>{car.style.display='none';last=null};
  function place(){
-  raf=0;document.body.classList.toggle('smoothcar',!LITE);
+  raf=0;document.body.classList.toggle('smoothcar',ST?.smooth_caret!==false);
   const t=document.activeElement;
-  if(LITE||!ok(t)||t.selectionStart!==t.selectionEnd){hide();return}
+  if(ST?.smooth_caret===false||!ok(t)||t.selectionStart!==t.selectionEnd){hide();return}
   const cs=getComputedStyle(t),r=t.getBoundingClientRect();
   if(!r.width){hide();return}
   meas.style.font=cs.font;meas.style.letterSpacing=cs.letterSpacing;meas.textContent=t.value.slice(0,t.selectionStart);
@@ -3189,6 +3327,15 @@ TRAY = None
 
 
 MAXED = [False]
+EXIT_CONFIRMED = False
+
+
+def on_window_closing():
+    if EXIT_CONFIRMED:
+        return True
+    # Alt+F4 and the native close action follow the title-bar's close-to-tray behavior.
+    WINDOW.hide()
+    return False
 
 
 def show_window(*_):
@@ -3201,7 +3348,29 @@ def show_window(*_):
         pass
 
 
-def quit_app():
+def open_file_items(paths):
+    items = []
+    for path in paths:
+        try:
+            items.append(FILES.open(path))
+        except (OSError, ValueError) as exc:
+            items.append({"error": f"{os.path.basename(path)}: {exc}"})
+    return items
+
+
+def request_app_exit(action):
+    show_window()
+    try:
+        WINDOW.evaluate_js("window.HelpyNotes && HelpyNotes.requestExit(%s)" % json.dumps(action))
+    except Exception:
+        pass  # Never discard documents if the bridge is temporarily unavailable.
+
+
+def quit_app(confirmed=False):
+    global EXIT_CONFIRMED
+    if not confirmed:
+        return request_app_exit("quit")
+    EXIT_CONFIRMED = True
     audio_abort()
     try:
         TRAY.stop()
@@ -3246,6 +3415,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", metavar="PRESET", help="apply a saved preset and exit")
     ap.add_argument("--minimized", action="store_true", help="start hidden in the tray")
+    ap.add_argument("--open", nargs="+", metavar="FILE", help="open supported files in Helpy")
+    ap.add_argument("files", nargs="*", help="files to open")
     ap.add_argument("--snip", nargs=4, metavar=("IMG", "OUT", "VX", "VY"), help=argparse.SUPPRESS)
     ap.add_argument("--toast", nargs=3, metavar=("IMG", "TITLE", "BODY"), help=argparse.SUPPRESS)
     a = ap.parse_args()
@@ -3260,6 +3431,7 @@ def main():
         ok, msg = apply_preset_obj(p)
         sys.exit(0 if ok else msg)
 
+    OPEN_REQUESTS.enqueue((a.open or []) + a.files)
     if not single_instance():
         return
     if IS_EXE and startup_enabled():
@@ -3267,15 +3439,18 @@ def main():
     clean_old_update()
     apply_saved_colors()
     import webview
-    WINDOW = webview.create_window("Helpy", html=HTML, js_api=Api(), width=1120, height=760,
+    with open(resource_path("assets", "helpy-icon.png"), "rb") as logo_file:
+        logo_uri = "data:image/png;base64," + base64.b64encode(logo_file.read()).decode("ascii")
+    WINDOW = webview.create_window("Helpy", html=build_html(logo_uri), js_api=Api(), width=1120, height=760,
                                    frameless=True, easy_drag=False, resizable=False,
                                    background_color="#1c1c1e", hidden=a.minimized)
+    WINDOW.events.closing += on_window_closing
     TRAY = build_tray()
     TRAY.run_detached()
     update_badge(False)
     start_hook()
     threading.Thread(target=display_watcher, daemon=True).start()
-    webview.start()
+    webview.start(icon=resource_path("assets", "helpy.ico"))
     TRAY.stop()
 
 

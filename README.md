@@ -9,6 +9,7 @@ A Windows utility for display controls, screenshots, audio recording, and local 
 ### Notepad and opening files
 
 - Open several text files in separate tabs, create new notes, save, and save as another file.
+- Find text with **Ctrl+F**, match counts, next/previous navigation, and a match-case option. Enter/Shift+Enter or F3/Shift+F3 moves between matches. Navigation is limited to the first 10,000 matches to keep large searches responsive.
 - Switch between editable text and a formatted Markdown preview with headings, lists, tables, quotes, and fenced code blocks.
 - Enable or disable syntax highlighting. Language detection follows the extension, with a manual language selector.
 - Syntax modes include Markdown, Python, JavaScript, TypeScript, JSON, HTML, CSS, XML, YAML, C/C++, C#, Java, Shell, PowerShell, SQL, Rust, and Go. Other supported text files open as plain text.
@@ -23,7 +24,7 @@ Supported text extensions: `.txt`, `.md`, `.markdown`, `.log`, `.json`, `.jsonc`
 
 Text files are limited to 2 MB. UTF-8 and BOM-marked UTF-16/UTF-32 are supported; encoding, byte order, and the detected line-ending style are preserved on save. Legacy encodings and binary content are rejected rather than silently converted. Mixed line endings are normalized to the detected style when saved.
 
-Supported images: PNG, JPEG, BMP, and WebP, up to 40 MB when opened externally. They open in the existing image viewer, with copy, reveal, delete, and editing actions. Images are not text tabs.
+Supported images: PNG, JPEG, BMP, WebP, and ICO, up to 40 MB when opened externally. They open in the existing image viewer, with copy, reveal, delete, and editing actions. ICO previews use the largest frame; overwriting an edited icon regenerates its fitting size variants in ICO format. Images are not text tabs. If Explorer integration was already enabled before ICO support, turn it off and back on to register the new extension.
 
 | Shortcut | Notepad action |
 | --- | --- |
@@ -32,6 +33,8 @@ Supported images: PNG, JPEG, BMP, and WebP, up to 40 MB when opened externally. 
 | Ctrl+S | Save |
 | Ctrl+Shift+S | Save as |
 | Ctrl+W | Close current tab |
+| Ctrl+F | Find in the current file |
+| F3 / Shift+F3 | Next / previous search match |
 | Ctrl+Z / Ctrl+Y | Undo / redo in the editor |
 
 Unsaved tabs are kept in memory, not restored after a crash or Windows shutdown. Save work you want to keep.
@@ -52,6 +55,7 @@ Unsaved tabs are kept in memory, not restored after a crash or Windows shutdown.
 - Gallery with thumbnails, unseen badges, search, sorting, and multiselect deletion to the Recycle Bin.
 - PNG, JPEG, and WebP output with quality settings.
 - Image viewer with navigation, zoom, panning, and fullscreen view.
+- ICO files are also included in the gallery when saved in the screenshot folder.
 - Brush, highlighter, arrows, rectangles, text, pixelation, blur, crop, and undo; save a copy or overwrite.
 
 ### Audio

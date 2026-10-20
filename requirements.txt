@@ -2,6 +2,7 @@ pywebview>=5.0
 pystray
 pillow
 numpy
+sounddevice
 comtypes
 opencv-python-headless
 dxcam

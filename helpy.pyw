@@ -362,7 +362,7 @@ DEF_SETTINGS = {
     "region": {"win": True, "ctrl": False, "shift": True, "alt": False, "vk": 0x53},  # Win+Shift+S
     "full": {"win": False, "ctrl": False, "shift": False, "alt": False, "vk": 0},
 }
-IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+IMG_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".ico")
 HK = {}
 CAP_LOCK = threading.Lock()
 _THUMBS = {}
@@ -1298,7 +1298,7 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.4.0"          # source version for the next user-published release
+APP_VERSION = "1.4.1"          # source version for the next user-published release
 UPDATE_REPO = "ahhmilo/Helpy"
 UPD = {"info": None, "busy": False}
 
@@ -1837,6 +1837,13 @@ class Api:
 
     def full(self, path):
         p = _safe(path)
+        if p.lower().endswith('.ico'):
+            from PIL import Image
+            with Image.open(p) as icon:
+                image = icon.convert('RGBA')
+                buffer = io.BytesIO()
+                image.save(buffer, 'PNG')
+            return 'data:image/png;base64,' + base64.b64encode(buffer.getvalue()).decode()
         mime = {"png": "png", "jpg": "jpeg", "jpeg": "jpeg", "bmp": "bmp", "webp": "webp"}[p.rsplit(".", 1)[-1].lower()]
         with open(p, "rb") as f:
             return f"data:image/{mime};base64," + base64.b64encode(f.read()).decode()
@@ -1969,6 +1976,11 @@ class Api:
             fmt = {".jpg": "jpg", ".jpeg": "jpg", ".webp": "webp"}.get(ext.lower(), "png")
             if ext.lower() == ".bmp":
                 im.convert("RGB").save(out, "BMP")
+                remove_unseen(out)
+                return out
+            if ext.lower() == ".ico":
+                from helpy_files import save_icon
+                save_icon(im, out)
                 remove_unseen(out)
                 return out
         else:  # a copy uses the format chosen in Settings
@@ -2116,9 +2128,9 @@ header{display:flex;align-items:center;height:48px;flex:none;padding-right:10px}
 main,aside{overflow-y:auto;overscroll-behavior:contain;padding:18px 28px 32px}
 aside{padding-left:4px;padding-right:24px}
 ::-webkit-scrollbar{width:16px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:var(--card2);border-radius:99px;border:5px solid transparent;background-clip:padding-box;min-height:48px}::-webkit-scrollbar-thumb:hover{background:var(--mu);background-clip:padding-box}
-.seg{position:relative;display:none;grid-auto-flow:column;grid-auto-columns:1fr;background:var(--card);border-radius:11px;padding:3px;margin-bottom:16px}
+.seg{position:relative;display:none;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);background:var(--card);border-radius:11px;padding:3px;margin-bottom:16px}
 .seg .thumb{position:absolute;top:3px;bottom:3px;left:3px;width:calc((100% - 6px)/var(--n));background:var(--card2);border-radius:8px;transform:translateX(calc(var(--i)*100%));transition:transform .45s var(--spring)}
-.sg{position:relative;background:none;padding:7px 10px;font-weight:500;color:var(--mu);transition:color .2s}.sg.on{color:var(--tx)}
+.sg{position:relative;min-width:0;background:none;padding:7px 10px;font-weight:500;color:var(--mu);transition:color .2s}.sg.on{color:var(--tx)}
 #hero{background:var(--card);border-radius:24px;padding:26px 28px;margin-bottom:22px}
 #hero.pop{animation:pop .5s var(--spring)}@keyframes pop{from{transform:scale(.97);opacity:.6}to{transform:none;opacity:1}}
 .mon{color:var(--mu);font-size:13px}
@@ -2355,7 +2367,7 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
 .climp{background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad);border-radius:99px;padding:2px 9px;font-size:11px;font-weight:600}
 
 /* ---- 4 tabs ---- */
-#nav{width:528px}
+#nav{width:620px;max-width:calc(100vw - 280px);grid-template-columns:repeat(5,minmax(0,1fr));flex-shrink:0}#nav .sg{padding-inline:6px;font-size:13px}
 .recdot{display:none;width:8px;height:8px;border-radius:50%;background:#ff453a;margin-left:7px;vertical-align:middle;animation:recp 1.2s ease-in-out infinite}
 .recdot.on{display:inline-block}
 @keyframes recp{50%{opacity:.35;transform:scale(.8)}}
@@ -2475,6 +2487,7 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
  </div>
  <div id="notes" class="page">
   <div class="note-toolbar"><button class="btn sec" id="note-new">New</button><button class="btn sec" id="note-open">Open…</button><button class="btn" id="note-save">Save</button><button class="btn sec" id="note-saveas">Save as…</button><span class="spacer"></span><label>Language <select id="note-language" aria-label="Syntax language"><option value="auto">Auto</option><option value="text/plain">Plain text</option><option value="text/x-markdown">Markdown</option><option value="text/x-python">Python</option><option value="text/javascript">JavaScript</option><option value="application/typescript">TypeScript</option><option value="application/json">JSON</option><option value="text/html">HTML</option><option value="text/css">CSS</option><option value="application/xml">XML</option><option value="text/x-yaml">YAML</option><option value="text/x-csrc">C</option><option value="text/x-c++src">C++</option><option value="text/x-csharp">C#</option><option value="text/x-java">Java</option><option value="text/x-sh">Shell</option><option value="application/x-powershell">PowerShell</option><option value="text/x-sql">SQL</option><option value="text/x-rustsrc">Rust</option><option value="text/x-go">Go</option></select></label><button class="btn sec" id="note-preview-toggle">Markdown preview</button></div>
+  <div class="note-search" id="note-search" hidden><input id="note-query" type="search" placeholder="Find in this file…" aria-label="Find in current document" autocomplete="off"><span id="note-matches" role="status" aria-live="polite">No matches</span><label><input id="note-match-case" type="checkbox">Match case</label><button class="mod" id="note-prev" title="Previous match (Shift+Enter)">Previous</button><button class="mod" id="note-next" title="Next match (Enter)">Next</button><button class="mod" id="note-search-close" aria-label="Close search">×</button></div>
   <div class="note-tabs" id="note-tabs" role="tablist" aria-label="Open documents"></div>
   <div class="note-conflict" id="note-conflict" role="status" hidden><span id="note-conflict-message"></span><button class="btn sec" id="note-reload">Reload disk version</button><button class="btn sec" id="note-copy">Save a copy</button><button class="btn sec" id="note-overwrite">Overwrite disk version</button></div>
   <div class="note-workspace"><div id="note-editor"></div><article id="note-preview" hidden></article><div id="note-empty"><b>A place for your files</b><span>Open text, Markdown or code. Keep each file in its own tab.</span><span>Ctrl+O to open · Ctrl+N for a new note</span></div></div>

@@ -20,11 +20,13 @@ A Windows utility for display controls, screenshots, audio recording, and local 
 
 Enable **Settings → Notepad → “Open with Helpy” in File Explorer** to add the context-menu entry. This does not change default file associations. On Windows 11, look under **Show more options**. Turn the setting off to remove the entry; re-enable it after moving the app or its source folder.
 
+In v1.4.2, Explorer sends files directly to the running app, including when it is hidden in the tray. Files open immediately on receipt rather than waiting for the editor's periodic disk check. An existing menu pointing to the same app location is upgraded automatically at launch. Opening a file while Helpy is fully closed still requires normal application startup.
+
 Supported text extensions: `.txt`, `.md`, `.markdown`, `.log`, `.json`, `.jsonc`, `.yaml`, `.yml`, `.toml`, `.ini`, `.cfg`, `.conf`, `.csv`, `.tsv`, `.xml`, `.html`, `.htm`, `.css`, `.scss`, `.js`, `.jsx`, `.ts`, `.tsx`, `.py`, `.pyw`, `.sh`, `.bat`, `.cmd`, `.ps1`, `.sql`, `.c`, `.h`, `.cpp`, `.hpp`, `.cs`, `.java`, `.rs`, `.go`.
 
 Text files are limited to 2 MB. UTF-8 and BOM-marked UTF-16/UTF-32 are supported; encoding, byte order, and the detected line-ending style are preserved on save. Legacy encodings and binary content are rejected rather than silently converted. Mixed line endings are normalized to the detected style when saved.
 
-Supported images: PNG, JPEG, BMP, WebP, and ICO, up to 40 MB when opened externally. They open in the existing image viewer, with copy, reveal, delete, and editing actions. ICO previews use the largest frame; overwriting an edited icon regenerates its fitting size variants in ICO format. Images are not text tabs. If Explorer integration was already enabled before ICO support, turn it off and back on to register the new extension.
+Supported images: PNG, JPEG, BMP, WebP, and ICO, up to 40 MB when opened externally. They open in the existing image viewer, with copy, reveal, delete, and editing actions. ICO previews use the largest frame; overwriting an edited icon regenerates its fitting size variants in ICO format. Images are not text tabs.
 
 | Shortcut | Notepad action |
 | --- | --- |
@@ -49,11 +51,13 @@ Unsaved tabs are kept in memory, not restored after a crash or Windows shutdown.
 ### Screenshots and editing
 
 - Rebindable region and full-screen shortcuts; region capture defaults to `Win+Shift+S`.
+- Region capture reuses a selector initialized in the background. It passes the captured screen in memory instead of saving a temporary PNG and launching a separate process for each selection.
 - Fullscreen-game-aware capture: exclusive fullscreen uses an instant full-screen shot rather than a selection overlay.
 - Save screenshots to your chosen folder and copy them to the clipboard.
 - Optional notification and capture sound, with fullscreen sound controls.
 - Gallery with thumbnails, unseen badges, search, sorting, and multiselect deletion to the Recycle Bin.
 - PNG, JPEG, and WebP output with quality settings.
+- PNG saves use faster lossless compression (potentially larger files, unchanged image quality). Captures are copied to the clipboard before file encoding finishes.
 - Image viewer with navigation, zoom, panning, and fullscreen view.
 - ICO files are also included in the gallery when saved in the screenshot folder.
 - Brush, highlighter, arrows, rectangles, text, pixelation, blur, crop, and undo; save a copy or overwrite.

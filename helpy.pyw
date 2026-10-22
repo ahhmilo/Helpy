@@ -332,6 +332,13 @@ def reset_color(dev):
 
 # --------------------------------------------------------------- screenshots
 import base64, datetime, io, subprocess, tempfile, threading, time
+from helpy_capture import RegionSelector
+from helpy_ipc import FileOpenServer
+
+REGION_SELECTOR = RegionSelector()
+OPEN_WAKE = threading.Event()
+UI_READY = threading.Event()
+FILE_SERVER = None
 
 SETTINGS_FILE = os.path.join(os.path.dirname(PRESET_FILE), "settings.json")
 DEF_SETTINGS = {
@@ -462,7 +469,7 @@ def save_image(img, path, fmt="png", quality=92):
     elif fmt == "webp":
         img.convert("RGB").save(path, "WEBP", quality=quality, method=4)
     else:
-        img.save(path, "PNG")
+        img.save(path, "PNG", compress_level=1)  # same pixels, less CPU before the file is ready
 
 
 def save_shot(img, folder):
@@ -934,17 +941,10 @@ def take(kind):
         vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
         if kind == "region" and not excl:
             img = ImageGrab.grab(all_screens=True)
-            tmp = os.path.join(tempfile.gettempdir(), "helpy_snip_full.png")
-            out = os.path.join(tempfile.gettempdir(), "helpy_snip_result.txt")
-            img.save(tmp)
-            if os.path.exists(out):
-                os.remove(out)
-            subprocess.run(self_cmd("--snip", tmp, out, str(vx), str(vy)), creationflags=NOWIN, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            try:
-                with open(out) as f:
-                    x, y, w, h = map(int, f.read().split())
-            except Exception:
-                return  # cancelled
+            region = REGION_SELECTOR.select(img, vx, vy)
+            if region is None:
+                return
+            x, y, w, h = region
             shot = img.crop((x, y, x + w, y + h))
         else:
             # full-screen capture, and "region" while an exclusive-fullscreen game has focus: no overlay
@@ -954,8 +954,8 @@ def take(kind):
             if shot is None:
                 l, t, r, b = rect
                 shot = ImageGrab.grab(all_screens=True).crop((l - vx, t - vy, r - vx, b - vy))
-        path = save_shot(shot, cfg["folder"])
         copy_to_clipboard(shot)
+        path = save_shot(shot, cfg["folder"])
         add_unseen(path)
         update_badge()
         in_fs = bool(in_fs) or excl  # exclusive fullscreen counts as fullscreen even if the window check missed it
@@ -1224,7 +1224,7 @@ def single_instance():
     def wait():
         while True:
             k.WaitForSingleObject(ev, 0xFFFFFFFF)
-            show_window()
+            OPEN_WAKE.set()
     threading.Thread(target=wait, daemon=True).start()
     return True
 
@@ -1298,7 +1298,7 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.4.1"          # source version for the next user-published release
+APP_VERSION = "1.4.2"          # source version for the next user-published release
 UPDATE_REPO = "ahhmilo/Helpy"
 UPD = {"info": None, "busy": False}
 
@@ -1734,6 +1734,10 @@ class Api:
     def file_requests(self):
         return {"items": open_file_items(OPEN_REQUESTS.drain())}
 
+    def file_ready(self):
+        UI_READY.set()
+        return {"ok": True}
+
     def file_context_menu(self, enabled=None):
         try:
             # Use a persistent icon in AppData; PyInstaller's extraction folder disappears on exit.
@@ -1747,7 +1751,8 @@ class Api:
                 pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
                 if os.path.exists(pythonw):
                     command[0] = pythonw
-            return context_menu(enabled, command, icon)
+            fast = FILE_SERVER is not None and FILE_SERVER.ready.is_set() and FILE_SERVER.error is None
+            return context_menu(enabled, command, icon, fast=fast)
         except OSError as exc:
             return {"ok": False, "msg": str(exc)}
 
@@ -3379,11 +3384,48 @@ def request_app_exit(action):
         pass  # Never discard documents if the bridge is temporarily unavailable.
 
 
+def receive_open_request(path):
+    if path:
+        OPEN_REQUESTS.submit([path])
+    OPEN_WAKE.set()
+
+
+def file_request_dispatcher():
+    while True:
+        OPEN_WAKE.wait()
+        OPEN_WAKE.clear()
+        UI_READY.wait()
+        show_window()
+        try:
+            WINDOW.evaluate_js('window.HelpyNotes && HelpyNotes.openRequestedFiles()')
+        except Exception:
+            pass  # The normal periodic check remains a fallback.
+
+
+def refresh_existing_file_menu():
+    """Upgrade an already-enabled menu owned by this app; never enable it for a new user."""
+    try:
+        state = context_menu()
+        command = self_cmd()
+        if not IS_EXE:
+            pythonw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+            if os.path.exists(pythonw):
+                command[0] = pythonw
+        expected = subprocess.list2cmdline(command) + ' --open "%1"'
+        if state.get('enabled') and state.get('command') == expected:
+            Api().file_context_menu(True)
+    except OSError:
+        pass
+
+
 def quit_app(confirmed=False):
     global EXIT_CONFIRMED
     if not confirmed:
         return request_app_exit("quit")
     EXIT_CONFIRMED = True
+    REGION_SELECTOR.close()
+    if FILE_SERVER:
+        FILE_SERVER.close()
     audio_abort()
     try:
         TRAY.stop()
@@ -3424,7 +3466,7 @@ def build_tray():
 
 
 def main():
-    global WINDOW, TRAY
+    global WINDOW, TRAY, FILE_SERVER
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", metavar="PRESET", help="apply a saved preset and exit")
     ap.add_argument("--minimized", action="store_true", help="start hidden in the tray")
@@ -3447,6 +3489,11 @@ def main():
     OPEN_REQUESTS.enqueue((a.open or []) + a.files)
     if not single_instance():
         return
+    FILE_SERVER = FileOpenServer(receive_open_request)
+    FILE_SERVER.start()
+    REGION_SELECTOR.start()
+    threading.Thread(target=file_request_dispatcher, name='Helpy open dispatch', daemon=True).start()
+    threading.Thread(target=refresh_existing_file_menu, name='Helpy menu refresh', daemon=True).start()
     if IS_EXE and startup_enabled():
         set_startup(True)  # re-point the startup entry if the exe was moved
     clean_old_update()

@@ -1244,6 +1244,18 @@ user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
 user32.GetAsyncKeyState.restype = ctypes.c_short
 _held = {"region": 0.0, "full": 0.0}
 _HOOK_REF = []
+_CAPTURE_REQUEST_LOCK = threading.Lock()
+_CAPTURE_LAST = 0.0
+
+
+def request_capture(kind):
+    global _CAPTURE_LAST
+    with _CAPTURE_REQUEST_LOCK:
+        now = time.monotonic()
+        if now - _CAPTURE_LAST < .4 or CAP_LOCK.locked():
+            return
+        _CAPTURE_LAST = now
+    threading.Thread(target=take, args=(kind,), daemon=True).start()
 
 
 def _mods():
@@ -1269,7 +1281,7 @@ def _hook(code, wparam, lparam):
                         if b["win"] or b["alt"]:  # stop Start / menu bar from opening on release
                             user32.keybd_event(0xE8, 0, 0, 0)
                             user32.keybd_event(0xE8, 0, 2, 0)
-                        threading.Thread(target=take, args=(kind,), daemon=True).start()
+                        request_capture(kind)
                         return 1
                     if isup and held:
                         _held[kind] = 0.0
@@ -1280,6 +1292,8 @@ def _hook(code, wparam, lparam):
 
 
 def start_hook():
+    from helpy_hotkeys import start_fallback
+    start_fallback(lambda: dict(HK), request_capture)
     def run():
         k32 = ctypes.windll.kernel32
         k32.GetModuleHandleW.restype = ctypes.c_void_p
@@ -1298,7 +1312,7 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.4.2"          # source version for the next user-published release
+APP_VERSION = "1.4.3"          # source version for the next user-published release
 UPDATE_REPO = "ahhmilo/Helpy"
 UPD = {"info": None, "busy": False}
 
@@ -1506,155 +1520,41 @@ def display_watcher(interval=2.0):
 
 
 # --- audio recorder (records through Windows' normal audio path, so Equalizer APO etc. apply) ----------
-AUDIO = {"stream": None, "frames": [], "n": 0, "rate": 48000, "level": -90.0, "peak_hold": -90.0,
-         "all_peak": -90.0, "wav": None, "full": False}
-AUDIO_LOCK = threading.Lock()
-MAX_REC_SECS = 600
+from helpy_audio import AudioEngine
+AUDIO_ENGINE = AudioEngine(os.path.join(os.path.dirname(PRESET_FILE), "recordings"))
 
 
-def _db(v):
-    import math
-    return -90.0 if v <= 3e-5 else max(-90.0, 20 * math.log10(v))
-
-
-def audio_devices():
-    try:
-        import sounddevice as sd
-    except Exception:
-        return {"ok": False, "msg": "Recording needs the 'sounddevice' package. Install it with: pip install sounddevice"}
-    try:
-        if AUDIO["stream"] is None:  # PortAudio only sees microphones that existed at start-up, so re-scan
-            try:
-                sd._terminate()
-                sd._initialize()
-            except Exception:
-                pass
-        apis, devs = sd.query_hostapis(), sd.query_devices()
-        wasapi = next((i for i, h in enumerate(apis) if "WASAPI" in h["name"]), None)
-        out, seen = [], set()
-        for i, d in enumerate(devs):
-            if d["max_input_channels"] < 1 or (wasapi is not None and d["hostapi"] != wasapi):
-                continue
-            key = d["name"].strip().lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({"id": i, "name": d["name"].strip()})
-        default = apis[wasapi]["default_input_device"] if wasapi is not None else sd.default.device[0]
-        if not out:
-            return {"ok": False, "msg": "No microphone found. Plug one in and come back to this tab."}
-        return {"ok": True, "devices": out, "default": default}
-    except Exception as e:
-        return {"ok": False, "msg": f"Couldn't list microphones: {e}"}
-
-
-def _audio_cb(indata, frames, tinfo, status):
-    import numpy as np
-    x = indata[:, 0].astype(np.float32) / 32768.0
-    rms = float(np.sqrt(np.mean(x * x))) if len(x) else 0.0
-    pk = float(np.max(np.abs(x))) if len(x) else 0.0
-    with AUDIO_LOCK:
-        AUDIO["frames"].append(indata.copy())
-        AUDIO["n"] += frames
-        AUDIO["level"] = _db(rms)
-        p = _db(pk)
-        AUDIO["peak_hold"] = max(AUDIO["peak_hold"], p)
-        AUDIO["all_peak"] = max(AUDIO["all_peak"], p)
-        if AUDIO["n"] >= AUDIO["rate"] * MAX_REC_SECS:
-            AUDIO["full"] = True
+def audio_devices(refresh=False):
+    return AUDIO_ENGINE.devices(refresh=refresh)
 
 
 def audio_start(dev):
-    if AUDIO["stream"] is not None:
-        return {"ok": True}
-    try:
-        import sounddevice as sd
-        info = sd.query_devices(int(dev))
-        rate = int(info["default_samplerate"]) or 48000
-        kw = dict(device=int(dev), channels=1, samplerate=rate, dtype="int16", callback=_audio_cb)
-        try:  # shared mode + automatic format conversion: goes through the Windows audio engine (and its APOs)
-            if "WASAPI" in sd.query_hostapis(info["hostapi"])["name"]:
-                kw["extra_settings"] = sd.WasapiSettings(auto_convert=True)
-        except Exception:
-            pass
-        with AUDIO_LOCK:
-            AUDIO.update(frames=[], n=0, rate=rate, level=-90.0, peak_hold=-90.0, all_peak=-90.0, full=False, wav=None)
-        st = sd.InputStream(**kw)
-        st.start()
-        AUDIO["stream"] = st
-        return {"ok": True, "rate": rate}
-    except Exception as e:
-        return {"ok": False, "msg": "Couldn't open that microphone. Another app may have it to itself, or Windows is blocking it "
-                                    "(Settings > Privacy & security > Microphone). " + str(e)[:90]}
+    return AUDIO_ENGINE.start(dev)
 
 
 def audio_level():
-    with AUDIO_LOCK:
-        r = {"rec": AUDIO["stream"] is not None, "level": AUDIO["level"], "peak": AUDIO["peak_hold"],
-             "secs": AUDIO["n"] / max(1, AUDIO["rate"]), "full": AUDIO["full"]}
-        AUDIO["peak_hold"] = -90.0
-    return r
+    return AUDIO_ENGINE.level()
 
 
 def audio_stop():
-    import wave
-    import numpy as np
-    st = AUDIO["stream"]
-    if st is None:
-        return {"ok": False, "msg": "Not recording."}
-    try:
-        st.stop()
-        st.close()
-    except Exception:
-        pass
-    AUDIO["stream"] = None
-    with AUDIO_LOCK:
-        frames, rate, allpeak = AUDIO["frames"], AUDIO["rate"], AUDIO["all_peak"]
-        AUDIO["frames"] = []
-    if not frames:
-        return {"ok": False, "msg": "Nothing was recorded."}
-    data = np.concatenate(frames)
-    folder = os.path.join(os.path.dirname(PRESET_FILE), "recordings")
-    os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, "recording.wav")
-    with wave.open(path, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(rate)
-        w.writeframes(data.tobytes())
-    AUDIO["wav"] = path
-    return {"ok": True, "secs": len(data) / rate, "rate": rate, "size": os.path.getsize(path),
-            "silent": allpeak < -75.0, "peak": allpeak}
+    return AUDIO_ENGINE.stop()
 
 
 def audio_chunk(off, n):
-    import base64
-    p = AUDIO["wav"]
-    if not p or not os.path.exists(p):
+    path = AUDIO_ENGINE.path
+    if not path or not os.path.exists(path):
         return ""
-    with open(p, "rb") as f:
-        f.seek(int(off))
-        return base64.b64encode(f.read(int(n))).decode()
+    with open(path, "rb") as f:
+        f.seek(max(0, int(off)))
+        return base64.b64encode(f.read(min(1048576, max(0, int(n))))).decode()
 
 
 def audio_discard():
-    p, AUDIO["wav"] = AUDIO["wav"], None
-    try:
-        if p and os.path.exists(p):
-            os.remove(p)
-    except OSError:
-        pass
+    AUDIO_ENGINE.discard()
 
 
 def audio_abort():
-    st = AUDIO["stream"]
-    AUDIO["stream"] = None
-    try:
-        if st is not None:
-            st.stop()
-            st.close()
-    except Exception:
-        pass
+    AUDIO_ENGINE.stop()
 
 
 def _restart_script(pid, args):
@@ -2008,11 +1908,14 @@ class Api:
         quit_app()  # really quits (tray menu -> Quit Helpy, or the forced-update prompt)
 
     # ---- audio tab
-    def audio_devices(self):
-        return audio_devices()
+    def audio_devices(self, refresh=False):
+        return audio_devices(refresh)
 
     def audio_start(self, dev):
         return audio_start(dev)
+
+    def audio_monitor(self, dev, delay):
+        return AUDIO_ENGINE.start(dev, monitor=True, delay=delay)
 
     def audio_level(self):
         return audio_level()
@@ -2030,7 +1933,7 @@ class Api:
     def audio_save(self):
         import shutil
         import webview
-        p = AUDIO["wav"]
+        p = AUDIO_ENGINE.path
         if not p or not os.path.exists(p):
             return {"ok": False, "msg": "There's no recording to save."}
         kind = webview.FileDialog.SAVE if hasattr(webview, "FileDialog") else webview.SAVE_DIALOG
@@ -2396,6 +2299,7 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
 .recbtn:hover{background:#e0244a}.recbtn:active{transform:scale(.96)}.recbtn[disabled]{opacity:.45;pointer-events:none}
 .recbtn .rd{display:block;width:12px;height:12px;border-radius:50%;background:#fff;transition:border-radius .25s,background .25s}
 .recbtn.on{background:var(--card2);color:var(--tx)}.recbtn.on:hover{background:var(--hv)}.recbtn.on .rd{border-radius:3px;background:#ff453a}
+.audio-player{display:flex;align-items:center;gap:14px;flex-wrap:wrap}.audio-player #aseek{flex:1;min-width:140px}.audio-player label{display:flex;align-items:center;gap:8px}.audio-player select{background:var(--bg);color:inherit;border:1px solid #8886;border-radius:8px;padding:8px}.audio-player input[type=range]{margin:12px 0;height:6px;background:linear-gradient(to right,var(--ac) var(--p,0%),var(--card2) var(--p,0%))}.audio-player label input{width:100px}.audio-player input[type=range]::-webkit-slider-thumb{width:16px;height:16px}.audio-player input:focus-visible{outline:2px solid var(--ac);outline-offset:6px}
 #ares{animation:fade .35s var(--ease)}
 </style></head><body>
 <div id="app">
@@ -2470,7 +2374,7 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
    <div class="ghead"><div><div class="gt">Audio</div><div class="mon">Record your voice and watch the level</div></div></div>
    <div class="au">
     <div class="aucard">
-     <div class="aulab">Microphone</div>
+     <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px"><div class="aulab" style="margin:0">Microphone</div><button class="btn sec" id="arefresh" onclick="aInit(true)">Refresh devices</button></div>
      <div class="dd wide" id="adev"><button class="ddb" aria-haspopup="listbox" aria-expanded="false"><span>Loading…</span><svg width="12" height="12" viewBox="0 0 12 12"><path d="M2.5 4.5L6 8l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button><div class="ddm" role="listbox"><div class="ddh">Input device</div><div data-items></div></div></div>
      <p class="note" id="amsg" style="margin:10px 0 0"></p>
     </div>
@@ -2481,11 +2385,13 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
      <canvas id="awave"></canvas>
      <div style="display:flex;align-items:center;gap:14px;margin-top:16px"><button class="recbtn" id="arec" onclick="aToggle()"><i class="rd"></i><span id="arect">Start recording</span></button><span class="note" id="astat" style="margin:0"></span></div>
     </div>
+    <div class="aucard"><div class="aulab">Live microphone playback</div><p class="note">Hear yourself without recording. Use headphones to avoid feedback. Zero adds no intentional delay; device latency still applies.</p><div class="audio-player"><label for="adelay">Delay</label><select id="adelay" aria-label="Microphone playback delay"><option value="0">0 seconds</option><option value="1">1 second</option><option value="2">2 seconds</option><option value="3">3 seconds</option><option value="4">4 seconds</option><option value="5">5 seconds</option></select><button class="btn sec" id="amon" onclick="aMonitor()">Start listening</button></div></div>
     <div class="aucard" id="ares" style="display:none">
      <div class="aulab">Your recording</div>
-     <audio id="aplay" controls style="width:100%"></audio>
+     <audio id="aplay" preload="metadata"></audio>
+     <div class="audio-player"><button class="btn" id="aplaybtn" onclick="aPlay()" aria-label="Play recording">Play</button><span id="aposition">0:00 / 0:00</span><input id="aseek" type="range" min="0" max="1000" value="0" aria-label="Recording position" oninput="aSeek(this.value)"><label>Volume <input type="range" min="0" max="1" step="0.01" value="1" style="--p:100%" aria-label="Playback volume" oninput="$('aplay').volume=Number(this.value);this.style.setProperty('--p',Number(this.value)*100+'%')"></label></div>
      <div class="note" id="ainfo" style="margin:10px 0 14px"></div>
-     <div style="display:flex;gap:10px"><button class="btn" onclick="aSave()">Download</button><button class="btn sec" onclick="aDiscard()">Discard</button></div>
+     <div style="display:flex;gap:10px"><button class="btn" id="asave" onclick="aSave()">Save WAV…</button><button class="btn sec" id="adiscard" onclick="aDiscard()">Discard</button></div>
     </div>
    </div>
   </main>
@@ -3257,49 +3163,60 @@ function mkDD(root,onPick){
  document.addEventListener('mousedown',e=>{if(isOpen()&&!root.contains(e.target))set(false)});
  return{fill,set,isOpen}}
 
-/* ---- audio tab: record, level meter, playback, download ---- */
-var AU={dev:null,devs:[],rec:false,poll:null,busy:false,hist:[],sm:-90,pk:-90,pkT:0,url:null,dd:null,ready:false};
-const fmtT=s=>{s=Math.floor(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+/* ---- audio: serialized controls, monitoring, and recording playback ---- */
+var AU={dev:null,devs:[],rec:false,monitor:false,transition:false,poll:null,busy:false,hist:[],sm:-90,pk:-90,pkT:0,url:null,dd:null,ready:false,loading:false};
+const fmtT=s=>{s=Math.floor(Number.isFinite(s)?s:0);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
 function aUi(){
  $('arec').classList.toggle('on',AU.rec);$('arect').textContent=AU.rec?'Stop recording':'Start recording';
+ $('arec').disabled=AU.loading||AU.transition||AU.monitor||!AU.dev;
+ $('amon').disabled=AU.loading||AU.transition||AU.rec||!AU.dev;$('amon').textContent=AU.monitor?'Stop listening':'Start listening';
+ $('arefresh').disabled=AU.loading||AU.transition||AU.rec||AU.monitor;$('arefresh').textContent=AU.loading?'Refreshing…':'Refresh devices';
+ $('adelay').disabled=AU.monitor||AU.rec||AU.transition;
+ for(const id of ['aplaybtn','asave','adiscard'])$(id).disabled=AU.transition||AU.rec||AU.monitor;
  $('atime').classList.toggle('on',AU.rec);$('recdot').classList.toggle('on',AU.rec);
- $('adev').querySelector('.ddb').disabled=AU.rec}
-async function aInit(){
- if(AU.rec)return;
- if(!AU.dd)AU.dd=mkDD($('adev'),it=>{AU.dev=AU.devs.find(d=>d.id===it.id);ST.audio_device=AU.dev.name;api().set_settings(ST).then(r=>{ST=r});aFillDev()});
- const r=await api().audio_devices();
- AU.ready=true;
- if(!r.ok){AU.devs=[];AU.dev=null;$('amsg').textContent=r.msg;$('arec').disabled=true;$('adev').querySelector('span').textContent='No microphone';return}
- $('arec').disabled=false;$('amsg').textContent='';
- AU.devs=r.devices;
- const keep=AU.dev&&AU.devs.find(d=>d.name===AU.dev.name),saved=AU.devs.find(d=>d.name===ST.audio_device);
- AU.dev=keep||saved||AU.devs.find(d=>d.id===r.default)||AU.devs[0];
- aFillDev();aDraw()}
-function aFillDev(){AU.dd.fill(AU.devs.map(d=>({id:d.id,label:d.name})),AU.dev?AU.dev.id:null)}
-async function aToggle(){
- if(AU.rec)return aStop();
- if(!AU.dev)return;
- aResetResult();
- const r=await api().audio_start(AU.dev.id);
- if(!r.ok){$('amsg').textContent=r.msg;return}
- $('amsg').textContent='';AU.rec=true;AU.hist=[];AU.sm=-90;AU.pk=-90;aUi();
- $('astat').textContent='Recording…';
- AU.poll=setInterval(aPoll,50)}
-async function aPoll(){
- if(AU.busy)return;AU.busy=true;
+ $('adev').querySelector('.ddb').disabled=AU.loading||AU.rec||AU.monitor||AU.transition;
+}
+async function aInit(refresh=true){
+ if(AU.rec||AU.monitor||AU.transition||AU.loading)return;AU.loading=true;aUi();
  try{
-  const r=await api().audio_level(),now=Date.now();
-  AU.sm=AU.sm*.55+r.level*.45;
-  if(r.peak>AU.pk||now-AU.pkT>1200){AU.pk=r.peak;AU.pkT=now}
-  const pct=v=>Math.max(0,Math.min(1,(v+60)/60));
-  $('afill').style.clipPath=`inset(0 ${(1-pct(AU.sm))*100}% 0 0)`;
-  const pk=$('apeak');pk.style.left=`calc(${pct(AU.pk)*100}% - 3px)`;pk.style.opacity=AU.pk>-60?1:0;
-  $('adb').textContent=AU.sm<=-89?'\u2212\u221e':Math.round(AU.sm);
-  $('atime').textContent=fmtT(r.secs);
-  AU.hist.push(pct(r.level));aDraw();
-  if(r.full)aStop()}
- catch(e){}
- AU.busy=false}
+ if(!AU.dd)AU.dd=mkDD($('adev'),it=>{AU.dev=AU.devs.find(d=>d.id===it.id);ST.audio_device=AU.dev.name;api().set_settings(ST).then(r=>{ST=r});aFillDev()});
+ const r=await api().audio_devices(refresh);AU.ready=true;
+ if(!r.ok){AU.devs=[];AU.dev=null;aFillDev();$('amsg').textContent=r.msg;return}
+ AU.devs=r.devices;
+ AU.dev=AU.devs.find(d=>d.name===(AU.dev?.name||ST.audio_device))||AU.devs.find(d=>d.id===r.default)||AU.devs[0];
+ aFillDev();aDraw();$('amsg').textContent='';
+ }catch(e){$('amsg').textContent=String(e)}finally{AU.loading=false;aUi()}
+}
+function aFillDev(){AU.dd.fill(AU.devs.map(d=>({id:d.id,label:d.name})),AU.dev?AU.dev.id:null)}
+async function aBegin(monitor){
+ if(AU.loading||AU.transition||AU.rec||AU.monitor||!AU.dev)return;
+ AU.transition=true;aUi();$('aplay').pause();
+ try{
+ const r=monitor?await api().audio_monitor(AU.dev.id,Number($('adelay').value)):await api().audio_start(AU.dev.id);
+ if(!r.ok){$('amsg').textContent=r.msg;return}
+ if(!monitor)aResetResult();
+ AU.rec=!monitor;AU.monitor=monitor;AU.hist=[];AU.sm=-90;AU.pk=-90;
+ $('amsg').textContent='';$('astat').textContent=monitor?'Listening — no recording is saved':'Recording…';
+ clearInterval(AU.poll);AU.poll=setInterval(aPoll,100);
+ }catch(e){$('amsg').textContent=String(e)}finally{AU.transition=false;aUi()}
+}
+function aToggle(){if(AU.transition)return;return AU.rec?aStop():aBegin(false)}
+function aMonitor(){if(AU.transition)return;return AU.monitor?aStop():aBegin(true)}
+async function aPoll(){
+ if(AU.busy||AU.transition)return;AU.busy=true;let stop=false;
+ try{
+ const r=await api().audio_level(),now=Date.now();AU.sm=AU.sm*.55+r.level*.45;
+ if(r.peak>AU.pk||now-AU.pkT>1200){AU.pk=r.peak;AU.pkT=now}
+ const pct=v=>Math.max(0,Math.min(1,(v+60)/60));
+ $('afill').style.clipPath=`inset(0 ${(1-pct(AU.sm))*100}% 0 0)`;
+ $('apeak').style.left=`calc(${pct(AU.pk)*100}% - 3px)`;$('apeak').style.opacity=AU.pk>-60?1:0;
+ $('adb').textContent=AU.sm<=-89?'−∞':Math.round(AU.sm);$('atime').textContent=fmtT(r.secs);
+ AU.hist.push(pct(r.level));if(AU.hist.length>400)AU.hist.shift();if(PG===2)aDraw();
+ if(r.error||r.warning)$('amsg').textContent=r.error||r.warning;
+ stop=r.full||(!r.rec&&!r.monitor);
+ }catch(e){$('amsg').textContent='Audio connection interrupted: '+String(e)}finally{AU.busy=false}
+ if(stop)aStop();
+}
 function aDraw(){
  const c=$('awave');if(!c||!c.clientWidth)return;
  const dpr=window.devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;
@@ -3312,28 +3229,33 @@ function aDraw(){
   x.fillStyle=v==null?'rgba(127,127,127,.25)':ac;x.beginPath();
   if(x.roundRect)x.roundRect(i*step,(h-bh)/2,3,bh,1.5);else x.rect(i*step,(h-bh)/2,3,bh);x.fill()}}
 async function aStop(){
- clearInterval(AU.poll);AU.poll=null;
- while(AU.busy)await new Promise(r=>setTimeout(r,20));
- const r=await api().audio_stop();AU.rec=false;aUi();
- $('afill').style.clipPath='inset(0 100% 0 0)';$('apeak').style.opacity=0;$('adb').textContent='\u2212\u221e';
- if(!r.ok){$('astat').textContent='';$('amsg').textContent=r.msg;return}
- $('astat').textContent='Preparing playback…';
+ if(AU.transition)return;AU.transition=true;aUi();clearInterval(AU.poll);AU.poll=null;
+ const wasMonitor=AU.monitor;
  try{
-  const parts=[],N=786432;
-  for(let o=0;o<r.size;o+=N){const b=atob(await api().audio_chunk(o,N)),u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);parts.push(u)}
-  if(AU.url)URL.revokeObjectURL(AU.url);
-  AU.url=URL.createObjectURL(new Blob(parts,{type:'audio/wav'}));$('aplay').src=AU.url;
- }catch(e){$('astat').textContent='';$('amsg').textContent="Couldn't load the recording for playback, but you can still download it.";}
- $('astat').textContent='';
- $('atime').textContent=fmtT(r.secs);
- $('ainfo').textContent=`${fmtT(r.secs)} \u00b7 ${(r.rate/1000).toFixed(1)} kHz \u00b7 mono \u00b7 ${(r.size/1048576).toFixed(1)} MB`;
- $('amsg').textContent=r.silent?'That recording is silent. Check that your microphone isn\u2019t muted and that Windows allows desktop apps to use it (Settings \u203a Privacy & security \u203a Microphone).':'';
- $('ares').style.display='';$('ares').style.animation='none';void $('ares').offsetWidth;$('ares').style.animation=''}
+ const r=await api().audio_stop();
+ if(!r.ok){$('amsg').textContent=r.msg;const state=await api().audio_level();AU.rec=state.rec;AU.monitor=state.monitor;if(AU.rec||AU.monitor)AU.poll=setInterval(aPoll,100);return}
+ AU.rec=false;AU.monitor=false;
+ $('afill').style.clipPath='inset(0 100% 0 0)';$('apeak').style.opacity=0;$('adb').textContent='−∞';
+ if(wasMonitor)return;
+ $('astat').textContent='Preparing playback…';$('amsg').textContent=r.warning||'';
+ const parts=[],N=786432;
+ try{
+ for(let o=0;o<r.size;o+=N){const b=atob(await api().audio_chunk(o,N));if(!b.length)throw Error('Incomplete recording');const u=new Uint8Array(b.length);for(let i=0;i<b.length;i++)u[i]=b.charCodeAt(i);parts.push(u);await new Promise(resolve=>setTimeout(resolve,0))}
+ if(AU.url)URL.revokeObjectURL(AU.url);
+ AU.url=URL.createObjectURL(new Blob(parts,{type:'audio/wav'}));$('aplay').src=AU.url;
+ }catch(e){$('amsg').textContent='Playback could not load. You can still save the WAV file.'}
+ $('atime').textContent=fmtT(r.secs);$('ainfo').textContent=`${fmtT(r.secs)} · ${(r.rate/1000).toFixed(1)} kHz · mono · ${(r.size/1048576).toFixed(1)} MB`;
+ if(r.silent)$('amsg').textContent='This recording is silent. Check microphone mute and Windows microphone permissions.';
+ $('ares').style.display='';
+ }catch(e){$('amsg').textContent=String(e)}finally{AU.transition=false;$('astat').textContent='';aUi()}
+}
+function aPlay(){const a=$('aplay');if(AU.rec||AU.monitor)return;if(a.paused)a.play().catch(e=>{$('amsg').textContent=String(e)});else a.pause()}
+function aSeek(value){const a=$('aplay');if(Number.isFinite(a.duration))a.currentTime=Number(value)/1000*a.duration}
+for(const event of ['timeupdate','loadedmetadata','play','pause','ended','emptied'])$('aplay').addEventListener(event,()=>{const a=$('aplay');$('aplaybtn').textContent=a.paused?'Play':'Pause';$('aplaybtn').setAttribute('aria-label',a.paused?'Play recording':'Pause recording');$('aposition').textContent=fmtT(a.currentTime)+' / '+fmtT(a.duration);$('aseek').value=a.duration?a.currentTime/a.duration*1000:0;$('aseek').style.setProperty('--p',Number($('aseek').value)/10+'%')});
 function aResetResult(){const a=$('aplay');a.pause();a.removeAttribute('src');a.load();if(AU.url){URL.revokeObjectURL(AU.url);AU.url=null}$('ares').style.display='none';$('atime').textContent='0:00';AU.hist=[];aDraw()}
-async function aDiscard(){aResetResult();await api().audio_discard();$('amsg').textContent=''}
+async function aDiscard(){if(AU.transition||AU.rec||AU.monitor)return;AU.transition=true;aUi();try{await api().audio_discard();aResetResult();$('amsg').textContent=''}catch(e){$('amsg').textContent=String(e)}finally{AU.transition=false;aUi()}}
 async function aSave(){
- const r=await api().audio_save();
- if(r.ok)toast('Saved '+String(r.path).split(/[\\/]/).pop());else if(!r.cancelled)toast(r.msg||"Couldn't save the recording",true)}
+ if(AU.transition||AU.rec||AU.monitor)return;AU.transition=true;aUi();try{const r=await api().audio_save();if(r.ok)toast('Recording saved');else if(!r.cancelled)toast(r.msg||'Could not save recording',true)}catch(e){toast(String(e),true)}finally{AU.transition=false;aUi()}}
 window.addEventListener('resize',()=>{if($('audio').classList.contains('on'))aDraw()});
 </script></body></html>
 """

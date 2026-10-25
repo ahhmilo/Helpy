@@ -65,8 +65,12 @@ Unsaved tabs are kept in memory, not restored after a crash or Windows shutdown.
 ### Audio
 
 - Select a microphone, record, and play back audio.
+- Recording operations are serialized and audio is written to a temporary WAV as it arrives, with a 10-minute limit. Device errors are shown in the Audio tab; available audio is kept when a recording is interrupted.
 - Live level meter, peak marker, and scrolling waveform.
-- Save recordings as WAV.
+- Play/pause, seek, adjust playback volume, and save recordings with **Save WAV…**.
+- **Live microphone playback** lets you listen without recording. Choose 0, 1, 2, 3, 4, or 5 seconds of added delay before starting. Stop listening to change the delay or start a recording. Playback uses the default output device on the microphone's audio host; use headphones to avoid feedback. Zero adds no intentional delay but still includes device latency.
+- Microphone monitoring never writes a recording and preserves the previous recording for playback or saving.
+- In v1.4.3, **Refresh devices** rescans connected microphones without restarting Helpy. The list also refreshes when returning to the Audio tab, retaining the selected microphone when available. Stop recording or listening before refreshing; active audio sessions are protected from device-list resets.
 - Native Windows recording path, compatible with microphone processing configured through Equalizer APO.
 
 ### Appearance and performance
@@ -135,6 +139,7 @@ Documents stay in their original locations. The Explorer integration uses the cu
 
 - The X button hides Helpy to the tray. Use **Quit Helpy** to exit.
 - While Helpy runs, its default `Win+Shift+S` binding takes precedence over Windows Snipping Tool. Change the binding or quit Helpy to restore the Windows shortcut.
+- Screenshot shortcuts also use Windows hotkey registration as a fallback for missed keyboard-hook events. Windows must be able to reserve the chosen combination; try a different binding if another app owns it. This does not bypass game or anti-cheat restrictions, and compatibility with Rocket League/EAC has not been verified.
 - Custom display modes must be accepted by your driver and monitor.
 - Microphone recording needs Windows permission for desktop apps to access the microphone.
 - Source and build changes do not publish a GitHub release automatically.

@@ -2,9 +2,26 @@
 
 # Helpy
 
+Current version: **v1.4.4**.
+
 A Windows utility for display controls, screenshots, audio recording, and local text files. Built with Python, native Windows APIs, and an HTML/CSS/JavaScript interface in pywebview.
 
 ## Features
+
+### Clipboard history
+
+- Enable **Settings → Clipboard history → Enable clipboard history (Win+V)** to collect future text and image copies and use Helpy's floating history panel. This is off by default and does not change Windows clipboard settings or import Windows history.
+- The panel opens near the text caret when available, otherwise beside the pointer, within the monitor's usable area. It is positioned before becoming visible, so reopening does not flash at its previous location. It follows Helpy's theme and animation preferences.
+- Search copied text, pin items, delete individual entries, or clear history. Clear preserves pins unless **Include pinned items** is selected. Identical copies reuse their entry and move it to the top.
+- Click an item or use arrow keys and Enter to paste into the previous app. **Copy** places it on the clipboard for manual pasting. Escape, Win+V again, or clicking outside dismisses the panel.
+- Automatic paste depends on Windows focus and input permissions. When it cannot be completed, the item remains copied and Helpy prompts you to paste manually. Elevated apps and restricted games may require this fallback.
+- Choose **25 / 100 / 500 items** using the segmented selector in Settings (100 by default). Enablement and the selected limit persist across restarts. Pins survive automatic eviction. History has a 200 MB storage cap, a 20 MB item cap, and a 32-megapixel image limit. Oversized or unsupported items are skipped; pinned entries are never automatically deleted to make room.
+- Text, images, and saved previews are encrypted using Windows DPAPI for the current user and stored locally in `%LOCALAPPDATA%\Helpy\clipboard\history.sqlite3`. History survives restarting Helpy, but is not intended to be portable between Windows accounts or computers.
+- Clipboard formats explicitly excluding history are respected. Ordinary copied sensitive text can still enter history if its source provides no exclusion flag. No clipboard data is uploaded or logged.
+- Turning the feature off stops collection and restores normal Win+V behavior without deleting saved items. Use **Open history** in Settings or **Clipboard history** in the tray to manage saved entries while collection is off.
+- Collection uses Windows clipboard-change notifications across apps, including normal text copies from Helpy Notepad. Only writes made by the history panel itself are suppressed to prevent capture loops. Apps must publish a supported text or image format and allow history collection.
+- The panel reuses unchanged cards and cached thumbnails, bounds concurrent thumbnail loading, and preserves scroll position and the current page during background updates. Selecting a search result waits until the pending search completes.
+- Formatting, copied file references, cloud sync, and OCR are not included. Closing Helpy releases its shortcut interception.
 
 ### Notepad and opening files
 

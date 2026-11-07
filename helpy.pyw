@@ -334,6 +334,8 @@ def reset_color(dev):
 import base64, datetime, io, subprocess, tempfile, threading, time
 from helpy_capture import RegionSelector
 from helpy_ipc import FileOpenServer
+from helpy_clipboard import ClipboardService
+CLIPBOARD = None
 
 REGION_SELECTOR = RegionSelector()
 OPEN_WAKE = threading.Event()
@@ -356,6 +358,8 @@ DEF_SETTINGS = {
     "syntax": True,
     "theme": "auto",
     "audio_device": "",
+    "clipboard_enabled": False,
+    "clipboard_limit": 100,
     "gallery_sort": "new",
     "img_format": "png",
     "img_quality": 92,
@@ -392,11 +396,13 @@ def load_settings():
 
 
 def save_settings(s):
+    global HK
     os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f, indent=2)
-    HK.clear()
-    HK.update(s)
+    HK = dict(s)
+    if CLIPBOARD:
+        CLIPBOARD.configure(s)
     return s
 
 
@@ -1265,10 +1271,14 @@ def _mods():
 
 def _hook(code, wparam, lparam):
     try:
-        if code == 0 and HK.get("enabled"):
+        if code == 0:
             k = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             if not k.flags & 0x10:  # ignore injected keys, including our own
                 isdown, isup = wparam in (0x100, 0x104), wparam in (0x101, 0x105)
+                if CLIPBOARD and k.vkCode == 0x56 and CLIPBOARD.handle_key(k.vkCode, isdown, isup, _mods()):
+                    return 1
+                if not HK.get("enabled"):
+                    return user32.CallNextHookEx(None, code, wparam, lparam)
                 for kind in ("region", "full"):
                     b = HK[kind]
                     if not b["vk"] or k.vkCode != b["vk"]:
@@ -1300,6 +1310,8 @@ def start_hook():
         proc = HOOKPROC(_hook)
         _HOOK_REF.append(proc)
         if not user32.SetWindowsHookExW(13, proc, k32.GetModuleHandleW(None), 0):
+            if CLIPBOARD:
+                CLIPBOARD.message = 'Windows shortcut interception is unavailable. Open clipboard history from the tray or Settings.'
             return
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -1312,7 +1324,7 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.4.3"          # source version for the next user-published release
+APP_VERSION = "1.4.4"          # source version for the next user-published release
 UPDATE_REPO = "ahhmilo/Helpy"
 UPD = {"info": None, "busy": False}
 
@@ -1587,6 +1599,15 @@ def restart_app(confirmed=False):
 
 
 class Api:
+    def clipboard_open(self):
+        if CLIPBOARD:
+            CLIPBOARD.open()
+            return {"ok": True}
+        return {"ok": False, "msg": "Clipboard history could not initialize."}
+
+    def clipboard_status(self):
+        return {"status": CLIPBOARD.status() if CLIPBOARD else "Clipboard history could not initialize."}
+
     def file_new(self):
         return FILES.new()
 
@@ -1685,6 +1706,9 @@ class Api:
         cur["cursor_style"] = s.get("cursor_style") if s.get("cursor_style") in ("line", "block", "underline") else "line"
         cur["theme"] = s.get("theme") if s.get("theme") in ("auto", "light", "dark") else "auto"
         cur["audio_device"] = str(s.get("audio_device", ""))[:200]
+        cur["clipboard_enabled"] = bool(s.get("clipboard_enabled", cur.get("clipboard_enabled", False)))
+        limit = s.get("clipboard_limit", cur.get("clipboard_limit", 100))
+        cur["clipboard_limit"] = limit if type(limit) is int and limit in (25, 100, 500) else cur.get("clipboard_limit", 100)
         cur["gallery_sort"] = s.get("gallery_sort") if s.get("gallery_sort") in ("new", "old", "az", "za", "big") else "new"
         cur["img_format"] = s.get("img_format") if s.get("img_format") in ("png", "jpg", "webp") else "png"
         try:
@@ -2434,6 +2458,8 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
     <div class="sl"><div><span>Background blur</span><label class="sw"><input type="checkbox" id="s_blur" onchange="saveEffects()"><i></i></label></div></div>
     <div class="sl"><div><span>Shadows</span><label class="sw"><input type="checkbox" id="s_shadows" onchange="saveEffects()"><i></i></label></div></div>
    </div>
+   <h3 style="margin-top:22px">Clipboard history</h3>
+   <div class="sl"><div><span>Enable clipboard history (Win+V)</span><label class="sw"><input type="checkbox" id="s_clipboard" onchange="saveClipboard()"><i></i></label></div><p class="note">Keep copied text and images locally and use Helpy for Win+V while it runs. Turning this off stops collection and leaves saved history intact.</p><div><span id="clipboardLimitLabel">Recent items</span><button class="btn sec" onclick="openClipboard()">Open history</button></div><div class="seg" id="clipboardLimitSeg" role="group" aria-labelledby="clipboardLimitLabel" style="display:grid;--n:3;--i:1;margin:10px 0 0"><div class="thumb" aria-hidden="true"></div><button class="sg" data-limit="25" onclick="saveClipboard(25)">25 items</button><button class="sg on" data-limit="100" onclick="saveClipboard(100)">100 items</button><button class="sg" data-limit="500" onclick="saveClipboard(500)">500 items</button></div><p class="note">Pinned items stay until deleted. Storage is limited to 200 MB; items to 20 MB. Clear saved items from the history panel.</p><p class="note" id="s_clipboard_status" role="status"></p></div>
    <h3 style="margin-top:22px">Notepad</h3>
    <div class="grp" style="max-width:640px">
     <div class="sl"><div><span>Syntax highlighting</span><label class="sw"><input type="checkbox" id="s_syntax" onchange="saveEffects()"><i></i></label></div></div>
@@ -2636,7 +2662,11 @@ function renderKeys(){
 async function saveST(){ST.enabled=$('sen').checked;ST=await api().set_settings(ST);renderKeys()}
 function mod(k,m){ST[k][m]=!ST[k][m];saveST()}
 function capKey(k){CAPK=k;const b=document.querySelector(`#krow_${k} .key`);b.textContent='Press a key…';b.classList.add('cap')}
-function renderSet(){renderSnd();applyTheme();renderFmt();renderEffects();applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
+function renderSet(){renderClipboard();renderSnd();applyTheme();renderFmt();renderEffects();applyLite();$('s_start').checked=!!ST.startup;$('s_start').disabled=!ST.startup_available;$('s_startnote').textContent=ST.startup_available?'Helpy starts hidden in the tray when you sign in.':'Only available in the built .exe. Running the .pyw never registers a startup entry.';$('s_game').checked=ST.game_mode!==false;$('s_notify').checked=ST.notify!==false}
+let clipboardSaving=false;
+function renderClipboard(){$('s_clipboard').checked=!!ST.clipboard_enabled;const limit=ST.clipboard_limit||100,seg=$('clipboardLimitSeg');seg.style.setProperty('--i',Math.max(0,[25,100,500].indexOf(limit)));seg.querySelectorAll('button').forEach(b=>{const active=Number(b.dataset.limit)===limit;b.classList.toggle('on',active);b.setAttribute('aria-pressed',String(active));b.disabled=clipboardSaving});$('s_clipboard').disabled=clipboardSaving}
+async function saveClipboard(limit){if(clipboardSaving)return;const previous={...ST},desired={...ST,clipboard_enabled:$('s_clipboard').checked,clipboard_limit:limit??ST.clipboard_limit??100};clipboardSaving=true;ST=desired;renderClipboard();$('s_clipboard_status').textContent='Saving…';try{const saved=await api().set_settings(desired);ST={...ST,clipboard_enabled:saved.clipboard_enabled,clipboard_limit:saved.clipboard_limit};$('s_clipboard_status').textContent=ST.clipboard_enabled?'Clipboard history is on. Press Win+V to open it.':'Clipboard history is off. Saved items are kept.';try{const r=await api().clipboard_status();if(r.status)$('s_clipboard_status').textContent=r.status}catch(e){}}catch(e){ST={...ST,clipboard_enabled:previous.clipboard_enabled,clipboard_limit:previous.clipboard_limit};$('s_clipboard_status').textContent='Could not save clipboard settings. Please try again.'}finally{clipboardSaving=false;renderClipboard()}}
+async function openClipboard(){const r=await api().clipboard_open();if(!r.ok)toast(r.msg,true)}
 async function saveSet(){
  ST.game_mode=$('s_game').checked;ST.notify=$('s_notify').checked;ST.sound=$('s_snd').checked;ST.volume=+$('s_vol').value;ST.quiet_fullscreen=$('s_quiet').checked;ST.sound_fs_only=$('s_fsonly').checked;
  await api().set_startup($('s_start').checked);ST=await api().set_settings(ST);renderKeys()}
@@ -3345,6 +3375,8 @@ def quit_app(confirmed=False):
     if not confirmed:
         return request_app_exit("quit")
     EXIT_CONFIRMED = True
+    if CLIPBOARD:
+        CLIPBOARD.close()
     REGION_SELECTOR.close()
     if FILE_SERVER:
         FILE_SERVER.close()
@@ -3377,6 +3409,7 @@ def build_tray():
 
     menu = pystray.Menu(
         pystray.MenuItem("Open Helpy", lambda icon, item: show_window(), default=True),
+        pystray.MenuItem("Clipboard history", lambda icon, item: CLIPBOARD.open() if CLIPBOARD else None),
         pystray.MenuItem("Screenshot (region)", lambda icon, item: threading.Thread(target=take, args=("region",), daemon=True).start()),
         pystray.MenuItem("Screenshot (full screen)", lambda icon, item: threading.Thread(target=take, args=("full",), daemon=True).start()),
         pystray.MenuItem("Presets", pystray.Menu(presets_menu)),
@@ -3388,7 +3421,7 @@ def build_tray():
 
 
 def main():
-    global WINDOW, TRAY, FILE_SERVER
+    global WINDOW, TRAY, FILE_SERVER, CLIPBOARD
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", metavar="PRESET", help="apply a saved preset and exit")
     ap.add_argument("--minimized", action="store_true", help="start hidden in the tray")
@@ -3427,6 +3460,8 @@ def main():
                                    frameless=True, easy_drag=False, resizable=False,
                                    background_color="#1c1c1e", hidden=a.minimized)
     WINDOW.events.closing += on_window_closing
+    CLIPBOARD = ClipboardService(load_settings(), resource_path)
+    CLIPBOARD.create_panel(webview)
     TRAY = build_tray()
     TRAY.run_detached()
     update_badge(False)

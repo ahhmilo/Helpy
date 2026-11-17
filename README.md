@@ -2,7 +2,7 @@
 
 # Helpy
 
-Current version: **v1.4.4**.
+Current version: **v1.4.5**.
 
 A Windows utility for display controls, screenshots, audio recording, and local text files. Built with Python, native Windows APIs, and an HTML/CSS/JavaScript interface in pywebview.
 
@@ -19,7 +19,8 @@ A Windows utility for display controls, screenshots, audio recording, and local 
 - Text, images, and saved previews are encrypted using Windows DPAPI for the current user and stored locally in `%LOCALAPPDATA%\Helpy\clipboard\history.sqlite3`. History survives restarting Helpy, but is not intended to be portable between Windows accounts or computers.
 - Clipboard formats explicitly excluding history are respected. Ordinary copied sensitive text can still enter history if its source provides no exclusion flag. No clipboard data is uploaded or logged.
 - Turning the feature off stops collection and restores normal Win+V behavior without deleting saved items. Use **Open history** in Settings or **Clipboard history** in the tray to manage saved entries while collection is off.
-- Collection uses Windows clipboard-change notifications across apps, including normal text copies from Helpy Notepad. Only writes made by the history panel itself are suppressed to prevent capture loops. Apps must publish a supported text or image format and allow history collection.
+- Brief clipboard contention is retried in the background for up to roughly 725 ms. A newer copy cancels the old capture attempt; persistent contention displays a capture error.
+- Collection uses Windows clipboard-change notifications, not keyboard shortcuts. **Ctrl+C, right-click Copy, and app or browser Copy buttons** are supported when they successfully write supported text or images to the Windows clipboard, including normal copies from Helpy Notepad. Only writes made by the history panel itself are suppressed to prevent capture loops. Apps must publish a supported text or image format and allow history collection.
 - The panel reuses unchanged cards and cached thumbnails, bounds concurrent thumbnail loading, and preserves scroll position and the current page during background updates. Selecting a search result waits until the pending search completes.
 - Formatting, copied file references, cloud sync, and OCR are not included. Closing Helpy releases its shortcut interception.
 
@@ -67,6 +68,8 @@ Unsaved tabs are kept in memory, not restored after a crash or Windows shutdown.
 
 ### Screenshots and editing
 
+Region selection uses a white crosshair outlined in black for visibility against light and dark content.
+
 - Rebindable region and full-screen shortcuts; region capture defaults to `Win+Shift+S`.
 - Region capture reuses a selector initialized in the background. It passes the captured screen in memory instead of saving a temporary PNG and launching a separate process for each selection.
 - Fullscreen-game-aware capture: exclusive fullscreen uses an instant full-screen shot rather than a selection overlay.
@@ -80,6 +83,8 @@ Unsaved tabs are kept in memory, not restored after a crash or Windows shutdown.
 - Brush, highlighter, arrows, rectangles, text, pixelation, blur, crop, and undo; save a copy or overwrite.
 
 ### Audio
+
+Live microphone playback has a 0–100% volume slider that works while listening. Zero mutes monitoring without changing recordings. The level resets to 100% when Helpy restarts.
 
 - Select a microphone, record, and play back audio.
 - Recording operations are serialized and audio is written to a temporary WAV as it arrives, with a 10-minute limit. Device errors are shown in the Audio tab; available audio is kept when a recording is interrupted.

@@ -1324,7 +1324,7 @@ HK.update(load_settings())
 
 
 # --- updater ---------------------------------------------------------------
-APP_VERSION = "1.4.4"          # source version for the next user-published release
+APP_VERSION = "1.4.5"          # source version for the next user-published release
 UPDATE_REPO = "ahhmilo/Helpy"
 UPD = {"info": None, "busy": False}
 
@@ -1941,6 +1941,13 @@ class Api:
     def audio_monitor(self, dev, delay):
         return AUDIO_ENGINE.start(dev, monitor=True, delay=delay)
 
+    def audio_monitor_volume(self, value):
+        value = float(value)
+        if not __import__("math").isfinite(value):
+            return {"ok": False}
+        AUDIO_ENGINE.monitor_volume = max(0., min(1., value / 100))
+        return {"ok": True}
+
     def audio_level(self):
         return audio_level()
 
@@ -2409,7 +2416,7 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
      <canvas id="awave"></canvas>
      <div style="display:flex;align-items:center;gap:14px;margin-top:16px"><button class="recbtn" id="arec" onclick="aToggle()"><i class="rd"></i><span id="arect">Start recording</span></button><span class="note" id="astat" style="margin:0"></span></div>
     </div>
-    <div class="aucard"><div class="aulab">Live microphone playback</div><p class="note">Hear yourself without recording. Use headphones to avoid feedback. Zero adds no intentional delay; device latency still applies.</p><div class="audio-player"><label for="adelay">Delay</label><select id="adelay" aria-label="Microphone playback delay"><option value="0">0 seconds</option><option value="1">1 second</option><option value="2">2 seconds</option><option value="3">3 seconds</option><option value="4">4 seconds</option><option value="5">5 seconds</option></select><button class="btn sec" id="amon" onclick="aMonitor()">Start listening</button></div></div>
+    <div class="aucard"><div class="aulab">Live microphone playback</div><p class="note">Hear yourself without recording. Use headphones to avoid feedback. Zero adds no intentional delay; device latency still applies.</p><div class="audio-player"><label for="adelay">Delay</label><select id="adelay" aria-label="Microphone playback delay"><option value="0">0 seconds</option><option value="1">1 second</option><option value="2">2 seconds</option><option value="3">3 seconds</option><option value="4">4 seconds</option><option value="5">5 seconds</option></select><label for="alivevolume">Volume</label><input id="alivevolume" type="range" min="0" max="100" value="100" aria-label="Live playback volume" oninput="this.nextElementSibling.textContent=this.value+'%';api().audio_monitor_volume(Number(this.value)).catch(e=>{$('amsg').textContent=String(e)})"><output>100%</output><button class="btn sec" id="amon" onclick="aMonitor()">Start listening</button></div></div>
     <div class="aucard" id="ares" style="display:none">
      <div class="aulab">Your recording</div>
      <audio id="aplay" preload="metadata"></audio>
@@ -2459,7 +2466,7 @@ body.smoothcar .form input,body.smoothcar #edhex,body.smoothcar input[type=text]
     <div class="sl"><div><span>Shadows</span><label class="sw"><input type="checkbox" id="s_shadows" onchange="saveEffects()"><i></i></label></div></div>
    </div>
    <h3 style="margin-top:22px">Clipboard history</h3>
-   <div class="sl"><div><span>Enable clipboard history (Win+V)</span><label class="sw"><input type="checkbox" id="s_clipboard" onchange="saveClipboard()"><i></i></label></div><p class="note">Keep copied text and images locally and use Helpy for Win+V while it runs. Turning this off stops collection and leaves saved history intact.</p><div><span id="clipboardLimitLabel">Recent items</span><button class="btn sec" onclick="openClipboard()">Open history</button></div><div class="seg" id="clipboardLimitSeg" role="group" aria-labelledby="clipboardLimitLabel" style="display:grid;--n:3;--i:1;margin:10px 0 0"><div class="thumb" aria-hidden="true"></div><button class="sg" data-limit="25" onclick="saveClipboard(25)">25 items</button><button class="sg on" data-limit="100" onclick="saveClipboard(100)">100 items</button><button class="sg" data-limit="500" onclick="saveClipboard(500)">500 items</button></div><p class="note">Pinned items stay until deleted. Storage is limited to 200 MB; items to 20 MB. Clear saved items from the history panel.</p><p class="note" id="s_clipboard_status" role="status"></p></div>
+   <div class="sl"><div><span>Enable clipboard history (Win+V)</span><label class="sw"><input type="checkbox" id="s_clipboard" onchange="saveClipboard()"><i></i></label></div><p class="note">Keep text and images copied with Ctrl+C, right-click Copy, or app and browser Copy buttons. Use Helpy for Win+V while it runs. Turning this off stops collection and leaves saved history intact.</p><div><span id="clipboardLimitLabel">Recent items</span><button class="btn sec" onclick="openClipboard()">Open history</button></div><div class="seg" id="clipboardLimitSeg" role="group" aria-labelledby="clipboardLimitLabel" style="display:grid;--n:3;--i:1;margin:10px 0 0"><div class="thumb" aria-hidden="true"></div><button class="sg" data-limit="25" onclick="saveClipboard(25)">25 items</button><button class="sg on" data-limit="100" onclick="saveClipboard(100)">100 items</button><button class="sg" data-limit="500" onclick="saveClipboard(500)">500 items</button></div><p class="note">Pinned items stay until deleted. Storage is limited to 200 MB; items to 20 MB. Clear saved items from the history panel.</p><p class="note" id="s_clipboard_status" role="status"></p></div>
    <h3 style="margin-top:22px">Notepad</h3>
    <div class="grp" style="max-width:640px">
     <div class="sl"><div><span>Syntax highlighting</span><label class="sw"><input type="checkbox" id="s_syntax" onchange="saveEffects()"><i></i></label></div></div>
